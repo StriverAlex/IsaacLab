@@ -9,3 +9,5 @@ Added
   one renderer transaction when LiDAR is enabled.
 * Add explicit ``OVRTXRendererCfg.read_gpu_transforms`` and ``motion_bvh`` settings so LiDAR can select OVRTX 0.4's
   required transform and motion paths without changing the established Camera-only defaults.
+* Let ``OVRTXLiDARCfg`` carry an optional project-owned profile spawner and local offset so one sensor config owns
+  authoring and clone-plan registration without moving vendor profiles into Isaac Lab core.

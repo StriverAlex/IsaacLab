@@ -143,7 +143,7 @@ OVRTX LiDAR
 The optional :class:`~isaaclab_ov.sensors.OVRTXLiDAR` adapter exposes point clouds from
 USD-authored ``OmniLidar`` prims. It deliberately separates three responsibilities:
 
-- the referenced USD asset owns the scan pattern, timing, range, and material response;
+- the referenced USD asset or caller-supplied profile spawner owns the scan pattern, timing, range, and material response;
 - Isaac Lab owns cloned-environment registration, lazy sensor updates, and stable batched tensors;
 - OVRTX owns GPU ray tracing and the ``PointCloud`` render output.
 
@@ -181,6 +181,11 @@ Configure the sensor on an ``OmniLidar`` prim already present under every cloned
        renderer_cfg=ovrtx_cfg,
    )
 
+Alternatively, pass a :class:`~isaaclab.sim.SpawnerCfg` through ``OVRTXLiDARCfg.spawn`` and a local
+``OVRTXLiDARCfg.OffsetCfg``. The sensor invokes that profile spawner before renderer preparation and queues the
+authored prim through the ordinary Isaac Lab clone plan. This keeps scene callers to one sensor configuration while
+leaving all profile attributes in project- or vendor-owned code.
+
 OVRTX 0.4 does not update dynamic LiDAR geometry reliably through its internal GPU transform cache, so a LiDAR
 renderer must set ``read_gpu_transforms=False``. :class:`~isaaclab_ov.sensors.OVRTXLiDARCfg` uses that value in
 its default renderer config and selects ``motion_bvh="auto"`` for moving sensors and geometry. When Camera and LiDAR
@@ -188,8 +193,9 @@ share a renderer, pass the same explicit config to both sensor configs. Camera-o
 :class:`~isaaclab_ov.renderers.OVRTXRendererCfg` keeps the established GPU-transform and motion-BVH defaults.
 
 The source prim must have type ``OmniLidar``, apply ``OmniSensorGenericLidarCoreAPI``, and author
-``omni:sensor:Core:elementsCoordsType = \"CARTESIAN\"``. The adapter does not synthesize a sensor
-profile or silently fall back to a generic ray caster when those requirements are missing.
+``omni:sensor:Core:elementsCoordsType = \"CARTESIAN\"``. The adapter does not synthesize a sensor profile: when
+``spawn`` is supplied it only invokes that explicit spawner. It never silently falls back to a generic ray caster
+when the authored requirements are missing.
 
 After the first emitted frame, :attr:`~isaaclab_ov.sensors.OVRTXLiDARData.point_cloud` has shape
 ``(num_envs, max_points, 3)``. Use :attr:`~isaaclab_ov.sensors.OVRTXLiDARData.valid` to mask padded or

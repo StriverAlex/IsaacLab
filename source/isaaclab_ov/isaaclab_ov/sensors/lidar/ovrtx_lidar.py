@@ -12,6 +12,7 @@ from hashlib import blake2s
 
 import warp as wp
 
+import isaaclab.sim as sim_utils
 from isaaclab import cloner
 from isaaclab.renderers import BaseRenderer
 from isaaclab.sensors import SensorBase
@@ -48,6 +49,19 @@ class OVRTXLiDAR(SensorBase):
 
     def __init__(self, cfg: OVRTXLiDARCfg):
         super().__init__(cfg)
+        spawn = self.cfg.spawn
+        if spawn is not None:
+            spawn_target = spawn.spawn_path or self.cfg.prim_path
+            if sim_utils.find_first_matching_prim(spawn_target) is None:
+                spawn.func(
+                    spawn_target,
+                    spawn,
+                    translation=self.cfg.offset.pos,
+                    orientation=self.cfg.offset.rot,
+                )
+            if not sim_utils.find_matching_prims(spawn_target):
+                raise RuntimeError(f"Could not find OVRTX LiDAR prim with path {spawn_target!r}.")
+            cloner.queue_replication(self._source_cfg)
         self._product_paths: tuple[str, ...] = ()
         self._data: OVRTXLiDARData | None = None
 

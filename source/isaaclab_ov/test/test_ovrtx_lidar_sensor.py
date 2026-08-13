@@ -33,6 +33,76 @@ def _frame(value: float) -> OVRTXLiDARFrame:
     )
 
 
+def test_sensor_spawns_an_optional_authored_lidar_profile(monkeypatch):
+    """A sensor-owned spawner hides profile authoring and replication ordering from scene callers."""
+    from isaaclab_ov.sensors import OVRTXLiDARCfg
+
+    from pxr import Usd
+
+    from isaaclab.sensors import sensor_base as sensor_base_module
+    from isaaclab.sim import SpawnerCfg
+    from isaaclab.sim.utils import create_prim
+    from isaaclab.sim.utils.stage import use_stage
+
+    spawn_calls = []
+    queued_cfgs = []
+
+    class CallbackHandle:
+        def deregister(self):
+            return None
+
+    class PhysicsManager:
+        @classmethod
+        def register_callback(cls, *_args, **_kwargs):
+            return CallbackHandle()
+
+    context = SimpleNamespace(
+        physics_manager=PhysicsManager,
+        vis_marker_registry=SimpleNamespace(clear_debug_vis_callback=lambda _sensor: None),
+    )
+    monkeypatch.setattr(
+        sensor_base_module.sim_utils.SimulationContext,
+        "instance",
+        classmethod(lambda _cls: context),
+    )
+    monkeypatch.setattr(ovrtx_lidar_module.cloner, "queue_replication", queued_cfgs.append)
+
+    def spawn_profile(prim_path, _cfg, translation=None, orientation=None):
+        spawn_calls.append((prim_path, translation, orientation))
+        return create_prim(
+            prim_path,
+            "OmniLidar",
+            translation=translation,
+            orientation=orientation,
+        )
+
+    stage = Usd.Stage.CreateInMemory()
+    stage.DefinePrim("/World/Robot", "Xform")
+    cfg = OVRTXLiDARCfg(
+        prim_path="/World/Robot/Lidar",
+        spawn=SpawnerCfg(func=spawn_profile),
+        offset=OVRTXLiDARCfg.OffsetCfg(
+            pos=(0.1, 0.2, 0.3),
+            rot=(0.0, 0.0, 0.0, 1.0),
+        ),
+    )
+
+    with use_stage(stage):
+        sensor = OVRTXLiDAR(cfg)
+    try:
+        assert spawn_calls == [
+            (
+                "/World/Robot/Lidar",
+                (0.1, 0.2, 0.3),
+                (0.0, 0.0, 0.0, 1.0),
+            )
+        ]
+        assert stage.GetPrimAtPath("/World/Robot/Lidar").GetTypeName() == "OmniLidar"
+        assert queued_cfgs == [cfg]
+    finally:
+        sensor._clear_callbacks()
+
+
 def test_update_reads_only_outdated_products_from_the_initialized_renderer(monkeypatch):
     """A data update consumes the prepared renderer and does not lazily initialize scene ownership."""
     events = []
