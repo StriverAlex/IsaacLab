@@ -9,6 +9,7 @@ from dataclasses import field
 from typing import TYPE_CHECKING
 
 from isaaclab.sensors import SensorBaseCfg
+from isaaclab.sim import SpawnerCfg
 from isaaclab.utils.configclass import configclass
 
 from ...renderers import OVRTXRendererCfg
@@ -21,6 +22,16 @@ if TYPE_CHECKING:
 class OVRTXLiDARCfg(SensorBaseCfg):
     """Configuration for a single-environment LiDAR whose point cloud is produced by OVRTX 0.4."""
 
+    @configclass
+    class OffsetCfg:
+        """Local pose of a spawned LiDAR prim relative to its parent."""
+
+        pos: tuple[float, float, float] = (0.0, 0.0, 0.0)
+        """Local translation in metres."""
+
+        rot: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0)
+        """Local quaternion in ``(x, y, z, w)`` order."""
+
     class_type: type["OVRTXLiDAR"] | str = "{DIR}.ovrtx_lidar:OVRTXLiDAR"
     """Associated OVRTX LiDAR sensor class."""
 
@@ -32,6 +43,16 @@ class OVRTXLiDARCfg(SensorBaseCfg):
     The default explicitly disables GPU transform-cache reads as required by
     OVRTX 0.4 LiDAR. A Camera sharing this renderer must use an equal config.
     """
+
+    spawn: SpawnerCfg | None = None
+    """Optional profile spawner for the authored ``OmniLidar`` prim.
+
+    When omitted, the prim must already exist in the scene. Profile attributes
+    remain asset-owned; the adapter only invokes the supplied spawner.
+    """
+
+    offset: OffsetCfg = OffsetCfg()
+    """Local pose passed to :attr:`spawn` when a profile is authored."""
 
     channels: tuple[str, ...] = (
         "Coordinates",
