@@ -29,6 +29,14 @@ def _product_path(sensor_prim_path: str) -> str:
     return f"/OVRTX/Products/Lidar_{digest}"
 
 
+def _authored_api_schemas(prim) -> tuple[str, ...]:
+    """Return composed API tokens, including schemas without a Python registration."""
+    schema_list_op = prim.GetMetadata("apiSchemas")
+    if schema_list_op is None:
+        return ()
+    return tuple(schema_list_op.GetAppliedItems())
+
+
 class OVRTXLiDAR(SensorBase):
     """Expose point clouds from authored OVRTX ``OmniLidar`` prims.
 
@@ -186,7 +194,7 @@ class OVRTXLiDAR(SensorBase):
                 raise RuntimeError(f"OVRTX LiDAR source prim '{source_path}' does not exist.")
             if prim.GetTypeName() != "OmniLidar":
                 raise RuntimeError(f"OVRTX LiDAR source prim '{source_path}' must have type OmniLidar.")
-            if "OmniSensorGenericLidarCoreAPI" not in prim.GetAppliedSchemas():
+            if "OmniSensorGenericLidarCoreAPI" not in _authored_api_schemas(prim):
                 raise RuntimeError(f"OVRTX LiDAR source prim '{source_path}' must apply OmniSensorGenericLidarCoreAPI.")
             coordinates_type = prim.GetAttribute("omni:sensor:Core:elementsCoordsType").Get()
             if coordinates_type != "CARTESIAN":
