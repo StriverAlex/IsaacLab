@@ -13,6 +13,11 @@ __all__ = [
     "ImuData",
     "JointWrenchSensor",
     "JointWrenchSensorData",
+    "OVRTXLiDAR",
+    "OVRTXLiDARCfg",
+    "OVRTXLiDARData",
+    "OVRTXLiDAROutputMetadata",
+    "OVRTXLiDARProductSpec",
     "Pva",
     "PvaData",
 ]
@@ -21,4 +26,5 @@ from .contact_sensor import ContactSensor, ContactSensorCfg, ContactSensorData
 from .frame_transformer import FrameTransformer, FrameTransformerData
 from .imu import Imu, ImuData
 from .joint_wrench import JointWrenchSensor, JointWrenchSensorData
+from .lidar import OVRTXLiDAR, OVRTXLiDARCfg, OVRTXLiDARData, OVRTXLiDAROutputMetadata, OVRTXLiDARProductSpec
 from .pva import Pva, PvaData

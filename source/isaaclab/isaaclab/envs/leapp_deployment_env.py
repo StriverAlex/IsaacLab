@@ -366,6 +366,7 @@ class LeappDeploymentEnv:
 
         self.scene.write_data_to_sim()
         self.sim.forward()
+        self.sim.render_context.reset_scene_state_cadence(self.sim.get_simulation_time())
         self.scene.update(dt=self.physics_dt)
 
         # If RTX sensors are present, rerender after reset to refresh their outputs.

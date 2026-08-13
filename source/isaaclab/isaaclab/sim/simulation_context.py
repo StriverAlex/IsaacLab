@@ -356,6 +356,10 @@ class SimulationContext:
         """Return the monotonic physics step counter (incremented each :meth:`step`)."""
         return self._physics_step_count
 
+    def get_simulation_time(self) -> float:
+        """Return the authoritative physics-backend simulation time [s]."""
+        return self.physics_manager.get_simulation_time()
+
     @property
     def render_context(self) -> RenderContext:
         """Shared :class:`~isaaclab.renderers.render_context.RenderContext` for camera renderers."""

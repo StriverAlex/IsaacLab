@@ -22,6 +22,11 @@ The following classes are part of the public :mod:`isaaclab_ov.sensors` API.
    ImuData
    JointWrenchSensor
    JointWrenchSensorData
+   OVRTXLiDAR
+   OVRTXLiDARCfg
+   OVRTXLiDARData
+   OVRTXLiDAROutputMetadata
+   OVRTXLiDARProductSpec
    Pva
    PvaData
 
@@ -50,6 +55,21 @@ The following classes are part of the public :mod:`isaaclab_ov.sensors` API.
    :show-inheritance:
 
 .. autoclass:: JointWrenchSensorData
+   :show-inheritance:
+
+.. autoclass:: OVRTXLiDAR
+   :show-inheritance:
+
+.. autoclass:: OVRTXLiDARCfg
+   :show-inheritance:
+
+.. autoclass:: OVRTXLiDARData
+   :show-inheritance:
+
+.. autoclass:: OVRTXLiDAROutputMetadata
+   :show-inheritance:
+
+.. autoclass:: OVRTXLiDARProductSpec
    :show-inheritance:
 
 .. autoclass:: Pva

@@ -25,6 +25,36 @@ class BaseRenderer(ABC):
         """Post-physics one-time initialization hook. Called only once."""
         return
 
+    def requires_continuous_advance(self) -> bool:
+        """Return whether this backend must advance whenever scene simulation time advances.
+
+        Time-integrating sensors such as a non-instantaneous LiDAR override this so
+        :class:`RenderContext` can drive their shared renderer independently of
+        consumer read order. Camera-only and stateless renderers remain on demand.
+        """
+        return False
+
+    def uses_frame_transactions(self) -> bool:
+        """Return whether :meth:`advance_frame` owns this backend's global frame clock."""
+        return False
+
+    def advance_frame(self, delta_time: float) -> None:
+        """Advance shared renderer time and cache product outputs for later reads.
+
+        Stateless backends leave this as a no-op and continue doing their work in
+        :meth:`render`. Backends that own a global sensor clock override it; their
+        consumer-specific render/read methods must not advance that clock again.
+
+        Args:
+            delta_time: Positive simulation-time interval since this renderer's
+                preceding frame transaction [s].
+        """
+        return
+
+    def reset_frame_transaction(self, simulation_time: float) -> None:
+        """Clear renderer-global sensor history at an authoritative simulation time."""
+        return
+
     def prepare_cameras(self, stage: Any, spec: CameraRenderSpec) -> None:
         """Pre-render per-camera setup the backend needs.
 

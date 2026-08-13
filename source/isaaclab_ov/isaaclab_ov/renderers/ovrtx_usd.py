@@ -9,10 +9,73 @@ from __future__ import annotations
 
 import logging
 import math
+from typing import TYPE_CHECKING
 
 from pxr import Sdf, Usd, UsdGeom
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from isaaclab_ov.sensors import OVRTXLiDARProductSpec
+
+
+def build_lidar_render_products_as_string(
+    specs: tuple[OVRTXLiDARProductSpec, ...],
+) -> tuple[str, tuple[str, ...]]:
+    """Build independent OVRTX PointCloud products for LiDAR sensors.
+
+    Each product targets exactly one sensor because OVRTX PointCloud output is not tiled.
+    The products live under ``/OVRTX`` so they can be appended beside the camera-owned
+    ``/Render`` scope without creating duplicate prim specs in the root layer.
+
+    Args:
+        specs: LiDAR product specifications to compile.
+
+    Returns:
+        USDA snippet and the corresponding render-product paths in input order.
+    """
+    if not specs:
+        return "", ()
+
+    product_defs: list[str] = []
+    render_var_defs: list[str] = []
+    for spec in specs:
+        product_name = spec.product_path.rsplit("/", 1)[-1]
+        render_var_name = f"PointCloud_{product_name}"
+        render_var_path = f"/OVRTX/Vars/{render_var_name}"
+        channels = ", ".join(f'"{channel}"' for channel in spec.channels)
+        product_defs.append(
+            f'''        def RenderProduct "{product_name}"
+        {{
+            rel camera = <{spec.sensor_prim_path}>
+            rel orderedVars = [<{render_var_path}>]
+        }}'''
+        )
+        render_var_defs.append(
+            f'''        def RenderVar "{render_var_name}"
+        {{
+            uniform string sourceName = "PointCloud"
+            token[] channels = [{channels}]
+        }}'''
+        )
+
+    return (
+        f"""
+def Scope "OVRTX"
+{{
+    def Scope "Products"
+    {{
+{chr(10).join(product_defs)}
+    }}
+
+    def Scope "Vars"
+    {{
+{chr(10).join(render_var_defs)}
+    }}
+}}
+""",
+        tuple(spec.product_path for spec in specs),
+    )
 
 
 def get_render_var_config(data_types: list[str]) -> tuple[str, str, str]:
@@ -245,16 +308,27 @@ def build_render_product_as_string(
 def create_scene_partition_attributes(
     stage,
     num_envs: int = 1,
+    *,
+    partition_single_environment: bool = True,
 ) -> None:
-    """Create scene partition attributes for env roots and cameras.
+    """Create scene partition attributes for cloned env roots and sensors.
 
     Camera prims are discovered by USD type (``UsdGeom.Camera``) rather than by name, so this works regardless of
     where the camera is placed in the hierarchy.
 
+    A single environment needs no scene isolation.  Leaving it unpartitioned is also required for OVRTX 0.4
+    LiDAR, whose non-tiled ``PointCloud`` product does not trace scene-partitioned geometry.
+
     Args:
         stage: USD stage to modify.
         num_envs: Number of environments.
+        partition_single_environment: Whether to author isolation metadata when
+            there is only one environment. OVRTX 0.4 LiDAR disables this because
+            PointCloud does not trace partitioned geometry.
     """
+    if num_envs <= 1 and not partition_single_environment:
+        return
+
     # Collect the attribute paths and scene partition tokens to update.
     attr_updates: list[tuple[Sdf.Path, str]] = []
     for env_idx in range(num_envs):
@@ -269,7 +343,7 @@ def create_scene_partition_attributes(
         for prim in Usd.PrimRange(env_prim):
             if prim.GetPath() == env_prim.GetPath():
                 attr_path = prim.GetPath().AppendProperty("primvars:omni:scenePartition")
-            elif prim.IsA(UsdGeom.Camera):
+            elif prim.IsA(UsdGeom.Camera) or prim.GetTypeName() == "OmniLidar":
                 attr_path = prim.GetPath().AppendProperty("omni:scenePartition")
             else:
                 continue

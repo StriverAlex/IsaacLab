@@ -59,6 +59,7 @@ try:
         BindingFlag,
         DataAccess,
         Device,
+        MotionBvh,
         PrimMode,
         Renderer,
         RendererConfig,
@@ -94,6 +95,7 @@ from .ovrtx_renderer_kernels import (
     sync_newton_transforms_kernel,
 )
 from .ovrtx_usd import (
+    build_lidar_render_products_as_string,
     build_render_product_as_string,
     create_scene_partition_attributes,
     export_stage_to_string,
@@ -106,6 +108,12 @@ if TYPE_CHECKING:
     from isaaclab.utils.warp import ProxyArray
 
 from isaaclab.renderers.camera_render_spec import CameraRenderSpec
+
+from isaaclab_ov.sensors.lidar.ovrtx_lidar_product import (
+    OVRTXLiDARFrame,
+    OVRTXLiDAROutputMetadata,
+    OVRTXLiDARProductSpec,
+)
 
 # The resolved integer value is assigned to the ``omni:rtx:minimal:mode`` attribute of the render product.
 _RTX_MINIMAL_MODES = {
@@ -194,14 +202,33 @@ def _raise_missing_ppisp_error(exc: ModuleNotFoundError) -> NoReturn:
     raise ModuleNotFoundError(_PPISP_IMPORT_ERROR_MESSAGE, name="isaaclab_ppisp") from exc
 
 
-def _read_gpu_transforms_enabled() -> bool:
+def _read_gpu_transforms_enabled(configured: bool | None) -> bool:
     """Return whether OVRTX should read GPU transforms from its internal transform cache."""
+    if configured is not None:
+        return configured
     value = os.environ.get(_READ_GPU_TRANSFORMS_ENV, "1").strip()
     if value not in {"0", "1"}:
         raise ValueError(
             f"Invalid value for environment variable `{_READ_GPU_TRANSFORMS_ENV}`: {value}. Expected 0 or 1."
         )
     return value == "1"
+
+
+def _motion_bvh_mode(configured: str | None) -> MotionBvh | None:
+    """Translate the lightweight renderer config into OVRTX's enum."""
+    modes = {
+        "disable": MotionBvh.DISABLE,
+        "enable": MotionBvh.ENABLE,
+        "auto": MotionBvh.AUTO,
+    }
+    if configured is None:
+        return None
+    try:
+        return modes[configured]
+    except KeyError as exc:
+        raise ValueError(
+            f"Invalid OVRTX motion_bvh mode {configured!r}. Expected one of {sorted(modes)} or None."
+        ) from exc
 
 
 def _resolve_rtx_minimal_mode(data_types: list[str]) -> int | None:
@@ -369,6 +396,11 @@ class OVRTXRenderer(BaseRenderer):
         self.cfg = cfg
         self._device = "cuda:0"  # default; overridden by create_render_data(spec)
         self._render_product_paths = []
+        self._camera_render_product_path: str | None = None
+        self._lidar_product_specs: dict[str, OVRTXLiDARProductSpec] = {}
+        self._lidar_output_metadata: dict[str, OVRTXLiDAROutputMetadata] = {}
+        self._last_step_products: Any | None = None
+        self._emitted_lidar_frames: dict[str, OVRTXLiDARFrame] = {}
         # Shared by both paths. The legacy-only binding handles that pair with these live in
         # _init_fields_legacy instead; the ovstage path drives the same offsets and counts
         # through its stage queries.
@@ -386,13 +418,15 @@ class OVRTXRenderer(BaseRenderer):
         # Selected once at construction so every dispatch method below sees a stable path for the
         # lifetime of the renderer, even if the environment variable changes mid-process.
         self._use_ovstage = ovrtx_use_ovstage_enabled()
+        self._read_gpu_transforms = _read_gpu_transforms_enabled(cfg.read_gpu_transforms)
         self._init_fields()
 
         logger.info("Creating OVRTX renderer...")
         OVRTX_CONFIG = RendererConfig(
             log_file_path=self.cfg.log_file_path,
             log_level=self.cfg.log_level,
-            read_gpu_transforms=_read_gpu_transforms_enabled(),
+            motion_bvh=_motion_bvh_mode(cfg.motion_bvh),
+            read_gpu_transforms=self._read_gpu_transforms,
             keep_system_alive=True,
         )
         self._renderer = Renderer(OVRTX_CONFIG)
@@ -402,6 +436,155 @@ class OVRTXRenderer(BaseRenderer):
                 " value. Check that ovrtx is installed correctly and its native dependencies are available."
             )
         logger.info("OVRTX renderer created successfully")
+
+    def requires_continuous_advance(self) -> bool:
+        """Return whether registered LiDAR products require simulation-time integration."""
+        return self._initialized_scene and bool(self._lidar_product_specs)
+
+    def uses_frame_transactions(self) -> bool:
+        """Return whether a registered LiDAR makes OVRTX own a simulation-time clock."""
+        return bool(self._lidar_product_specs)
+
+    def reset_frame_transaction(self, simulation_time: float) -> None:
+        """Reset OVRTX sensor history without inventing simulation time or retaining old frames."""
+        self._renderer.reset(simulation_time)
+        self._last_step_products = None
+        self._emitted_lidar_frames.clear()
+
+    def register_lidar_product(self, spec: OVRTXLiDARProductSpec) -> None:
+        """Register a LiDAR render product before the shared OVRTX scene is loaded.
+
+        Args:
+            spec: One-sensor OVRTX LiDAR product specification.
+
+        Raises:
+            RuntimeError: If the renderer is using the deprecated non-ovstage path.
+            RuntimeError: If the shared OVRTX scene has already been loaded.
+        """
+        if not self._use_ovstage:
+            raise RuntimeError("OVRTX LiDAR requires the ovstage scene-ownership path.")
+        if self._read_gpu_transforms:
+            raise RuntimeError(
+                "OVRTXRendererCfg.read_gpu_transforms=True is incompatible with OVRTX 0.4 LiDAR: "
+                "GPU transform propagation and geometry streaming do not update dynamic "
+                "LiDAR geometry reliably. Set read_gpu_transforms=False explicitly."
+            )
+        if self._initialized_scene:
+            raise RuntimeError("OVRTX LiDAR products must be registered before the OVRTX scene is loaded.")
+        registered = self._lidar_product_specs.get(spec.product_path)
+        if registered is not None and registered != spec:
+            raise ValueError(f"OVRTX render product '{spec.product_path}' is already registered for another sensor.")
+        self._lidar_product_specs[spec.product_path] = spec
+
+    def initialize_lidar_scene(self, num_envs: int) -> None:
+        """Load an OVRTX scene that has LiDAR products but no camera consumer.
+
+        The operation is lazy and idempotent so every scene sensor can register its
+        products before ovstage's single root layer becomes immutable.
+
+        Args:
+            num_envs: Number of cloned sensor instances in the scene.
+
+        Raises:
+            RuntimeError: If OVRTX 0.4 would need to trace scene-partitioned geometry for multiple environments.
+        """
+        if self._initialized_scene:
+            return
+        if not self._use_ovstage:
+            raise RuntimeError("OVRTX LiDAR requires the ovstage scene-ownership path.")
+        if not self._lidar_product_specs:
+            raise RuntimeError("No OVRTX LiDAR products were registered before scene initialization.")
+        self._initialize_lidar_scene_ovstage(num_envs)
+
+    def advance_frame(self, delta_time: float) -> None:
+        """Advance every registered OVRTX product in one renderer-wide transaction.
+
+        Args:
+            delta_time: Authoritative simulation-time interval since the preceding transaction [s].
+
+        Raises:
+            RuntimeError: If the shared scene is not initialized or a product returns an invalid frame count.
+            ValueError: If the time step is not positive.
+        """
+        if not self._initialized_scene:
+            raise RuntimeError("OVRTX scene is not initialized.")
+        if delta_time <= 0.0:
+            raise ValueError(f"OVRTX delta_time must be positive, got {delta_time}.")
+        if not self._render_product_paths:
+            raise RuntimeError("OVRTX has no registered render products to advance.")
+
+        if self._use_ovstage:
+            self._stage.advance_write_floor(ordinal=self._current_ordinal).wait()
+            products = self._renderer.step(
+                render_products=set(self._render_product_paths),
+                delta_time=delta_time,
+                ordinal=self._current_ordinal,
+            )
+            self._current_ordinal += 1
+        else:
+            products = self._renderer.step(
+                render_products=set(self._render_product_paths),
+                delta_time=delta_time,
+            )
+
+        self._emitted_lidar_frames.clear()
+        self._capture_lidar_frames(products)
+        self._last_step_products = products
+
+    def read_lidar(self, product_paths: tuple[str, ...]) -> dict[str, OVRTXLiDARFrame]:
+        """Return PointCloud frames emitted by the latest renderer transaction.
+
+        OVRTX may emit no frame for intermediate steps when ``partialOutputs=false``.
+        Missing products are omitted so the sensor data adapter can retain its previous
+        sample while marking that no fresh frame was emitted.
+        """
+        unknown_products = set(product_paths).difference(self._lidar_product_specs)
+        if unknown_products:
+            raise ValueError(f"Unregistered OVRTX LiDAR products requested: {sorted(unknown_products)}.")
+        return {path: self._emitted_lidar_frames[path] for path in product_paths if path in self._emitted_lidar_frames}
+
+    def _capture_lidar_frames(self, products: Any) -> None:
+        """Copy newly emitted PointCloud frames while the step result owns their mappings."""
+        # PyTorch exposes its default stream as handle ``0``, while OVRTX defines
+        # ``sync_stream=0`` as *no synchronization* and uses ``1`` as the default-
+        # stream sentinel. Translate only that reserved value; non-default CUDA
+        # stream handles pass through unchanged.
+        torch_stream = int(torch.cuda.current_stream(device=self._device).cuda_stream)
+        ovrtx_stream = torch_stream or 1
+        for product_path in self._lidar_product_specs:
+            try:
+                product = products[product_path]
+            except KeyError:
+                product = None
+            frame_count = 0 if product is None else len(product.frames)
+            if frame_count == 0:
+                continue
+            if frame_count != 1:
+                raise RuntimeError(
+                    f"OVRTX LiDAR product '{product_path}' returned {frame_count} frames in one simulation step; "
+                    "expected at most one. Reduce the simulation step below the authored LiDAR frame period."
+                )
+            frame = product.frames[0]
+            if "PointCloud" not in frame.render_vars:
+                raise RuntimeError(f"OVRTX LiDAR product '{product_path}' did not return PointCloud.")
+
+            mapping = frame.render_vars["PointCloud"].map(device=Device.CUDA, sync_stream=ovrtx_stream)
+            try:
+                tensors = {name: torch.from_dlpack(tensor).clone() for name, tensor in mapping.items()}
+                params = {name: torch.from_dlpack(param).clone() for name, param in mapping.params.items()}
+            finally:
+                mapping.unmap(stream=ovrtx_stream)
+            metadata = self._lidar_output_metadata.get(product_path)
+            if metadata is None:
+                raise RuntimeError(
+                    f"OVRTX LiDAR product '{product_path}' has no authored output metadata. "
+                    "Call prepare_stage() before advancing the renderer."
+                )
+            self._emitted_lidar_frames[product_path] = OVRTXLiDARFrame(
+                tensors=tensors,
+                params=params,
+                metadata=metadata,
+            )
 
     def prepare_cameras(self, stage: Any, spec: CameraRenderSpec) -> None:
         """Resolve the camera's PPISP cfg and apply OVRTX-specific USD overrides.
@@ -435,12 +618,18 @@ class OVRTXRenderer(BaseRenderer):
         if stage is None:
             return
 
+        self._validate_lidar_products(stage)
+
         # If temp_usd_dir is set, write the pre-ovrtx stage to a temporary file.
         if self.cfg.temp_usd_dir is not None:
             _write_file(Path(self.cfg.temp_usd_dir), "pre_ovrtx_renderer_stage.usda", stage.ExportToString())
 
         logger.info("Preparing stage (%d envs)...", num_envs)
-        create_scene_partition_attributes(stage, num_envs)
+        create_scene_partition_attributes(
+            stage,
+            num_envs,
+            partition_single_environment=not self._lidar_product_specs,
+        )
 
         # Resolve the clone plan for local use.
         self._clone_plan = _resolve_clone_plan(num_envs)
@@ -462,6 +651,49 @@ class OVRTXRenderer(BaseRenderer):
             source_paths=self._clone_plan.sources,
             keep_env_roots=not self._use_ovstage,
         )
+
+    def _validate_lidar_products(self, stage: Any) -> None:
+        """Validate authored OVRTX 0.4 constraints and retain immutable output semantics."""
+        metadata_by_product: dict[str, OVRTXLiDAROutputMetadata] = {}
+        for spec in self._lidar_product_specs.values():
+            prim = stage.GetPrimAtPath(spec.sensor_prim_path)
+            if not prim.IsValid():
+                raise RuntimeError(f"Registered OVRTX LiDAR prim '{spec.sensor_prim_path}' does not exist.")
+            max_returns = prim.GetAttribute("omni:sensor:Core:maxReturns").Get()
+            if max_returns != 1:
+                raise RuntimeError(
+                    "OVRTX 0.4 LiDAR products require omni:sensor:Core:maxReturns=1 because PointCloud reports "
+                    "EchoId=0 for every hit when multiple returns are enabled."
+                )
+            coordinate_frame = prim.GetAttribute("omni:sensor:Core:outputFrameOfReference").Get()
+            if not coordinate_frame:
+                raise RuntimeError(f"OVRTX LiDAR prim '{spec.sensor_prim_path}' must author outputFrameOfReference.")
+            motion_state = prim.GetAttribute("omni:sensor:Core:outputMotionCompensationState").Get()
+            if motion_state not in {"COMPENSATED", "NONCOMPENSATED"}:
+                raise RuntimeError(
+                    f"OVRTX LiDAR prim '{spec.sensor_prim_path}' has unsupported "
+                    f"outputMotionCompensationState={motion_state!r}."
+                )
+            instant_lidar = prim.GetAttribute("omni:sensor:Core:instantLidar").Get()
+            partial_outputs = prim.GetAttribute("omni:sensor:Core:partialOutputs").Get()
+            if not isinstance(instant_lidar, bool) or not isinstance(partial_outputs, bool):
+                raise RuntimeError(
+                    f"OVRTX LiDAR prim '{spec.sensor_prim_path}' must author boolean instantLidar and partialOutputs."
+                )
+            frame_rate = prim.GetAttribute("omni:sensor:frameRate").Get()
+            if frame_rate is None or len(frame_rate) != 2 or frame_rate[1] == 0:
+                raise RuntimeError(
+                    f"OVRTX LiDAR prim '{spec.sensor_prim_path}' must author frameRate as a nonzero rational pair."
+                )
+            metadata_by_product[spec.product_path] = OVRTXLiDAROutputMetadata(
+                coordinate_frame=str(coordinate_frame),
+                motion_compensated=motion_state == "COMPENSATED",
+                partial_outputs=partial_outputs,
+                instant_lidar=instant_lidar,
+                frame_rate_hz=float(frame_rate[0]) / float(frame_rate[1]),
+                max_returns=int(max_returns),
+            )
+        self._lidar_output_metadata = metadata_by_product
 
     def _init_fields_legacy(self) -> None:
         """Initialize the legacy-path instance fields.
@@ -497,10 +729,6 @@ class OVRTXRenderer(BaseRenderer):
         self._camera_rel_path = spec.camera_path_relative_to_env_0
 
         logger.info("Injecting camera definitions...")
-
-        if self._exported_usd_string is None:
-            raise RuntimeError("Expected an exported USD string from stage")
-
         render_product_string, render_product_path = build_render_product_as_string(
             width=width,
             height=height,
@@ -510,6 +738,7 @@ class OVRTXRenderer(BaseRenderer):
             camera_rel_path=self._camera_rel_path,
             background_color=getattr(spec.cfg, "background_color", None),
         )
+        self._camera_render_product_path = render_product_path
         self._render_product_paths.append(render_product_path)
 
         combined_usd_string = self._exported_usd_string + "\n\n" + render_product_string
@@ -1389,13 +1618,18 @@ class OVRTXRenderer(BaseRenderer):
         """Render the scene into the provided RenderData."""
         if not self._initialized_scene:
             raise RuntimeError("Scene not initialized. Call initialize() first.")
-        if self._renderer is None or len(self._render_product_paths) == 0:
+        if self._renderer is None or self._camera_render_product_path is None:
             return
-        products = self._renderer.step(
-            render_products=set(self._render_product_paths),
-            delta_time=1.0 / 60.0,
-        )
-        product_path = self._render_product_paths[0]
+        if self.uses_frame_transactions():
+            if self._last_step_products is None:
+                raise RuntimeError("OVRTX advance_frame() must run before camera output is read.")
+            products = self._last_step_products
+        else:
+            products = self._renderer.step(
+                render_products=set(self._render_product_paths),
+                delta_time=1.0 / 60.0,
+            )
+        product_path = self._camera_render_product_path
         if product_path in products and len(products[product_path].frames) > 0:
             self._process_render_frame(
                 render_data,
@@ -1448,6 +1682,11 @@ class OVRTXRenderer(BaseRenderer):
             self._renderer = None
 
         self._render_product_paths.clear()
+        self._camera_render_product_path = None
+        self._lidar_product_specs.clear()
+        self._lidar_output_metadata.clear()
+        self._emitted_lidar_frames.clear()
+        self._last_step_products = None
         self._output_id_color_buffers.clear()
         self._initialized_scene = False
 
@@ -1599,33 +1838,9 @@ class OVRTXRenderer(BaseRenderer):
             minimal_mode=_resolve_rtx_minimal_mode(data_types),
             camera_rel_path=self._camera_rel_path,
         )
+        self._camera_render_product_path = render_product_path
         self._render_product_paths.append(render_product_path)
-
-        combined_usd_string = self._exported_usd_string + "\n\n" + render_product_string
-        self._exported_usd_string = None  # Free memory
-
-        # If temp_usd_dir is set, write the combined USD stage to a temporary file.
-        if self.cfg.temp_usd_dir is not None:
-            _write_file(Path(self.cfg.temp_usd_dir), "ovrtx_renderer_stage.usda", combined_usd_string)
-
-        logger.info("Loading USD into OvRTX via ovstage...")
-        self._ovstage_exit_stack = contextlib.ExitStack()
-        self._stage = self._ovstage_exit_stack.enter_context(ovstage.Stage("isaaclab.ovrtx"))
-        self._stage_paths = self._ovstage_exit_stack.enter_context(ovstage.PathDictionary(self._stage))
-        # Ordinal 0 is the empty/unwritten state in ovstage; the first write must use >= 1.
-        self._current_ordinal += 1
-        ovstage.population.open_usd_from_string(
-            self._stage,
-            combined_usd_string,
-            ordinal=self._current_ordinal,
-            domains=ovstage.PopulationDomain.RENDERING,
-        )
-
-        if num_envs > 1:
-            self._clone_sources_ovstage()
-            self._update_scene_partitions_after_clone_ovstage(num_envs)
-
-        self._initialized_scene = True
+        self._open_scene_ovstage(num_envs, (render_product_string,))
 
         camera_paths = [f"/World/envs/env_{i}/{self._camera_rel_path}" for i in range(num_envs)]
 
@@ -1665,14 +1880,66 @@ class OVRTXRenderer(BaseRenderer):
             is_array=False,
         ).wait()
 
+        self._finalize_scene_ovstage(num_envs)
+
+    def _initialize_lidar_scene_ovstage(self, num_envs: int) -> None:
+        """Initialize the shared ovstage root for a scene without a camera consumer."""
+        self._open_scene_ovstage(num_envs, ())
+        self._finalize_scene_ovstage(num_envs)
+
+    def _open_scene_ovstage(self, num_envs: int, product_strings: tuple[str, ...]) -> None:
+        """Compose all registered products and populate the single ovstage root layer."""
+        if self._exported_usd_string is None:
+            raise RuntimeError("Expected an exported USD string from stage")
+        if num_envs > 1 and self._lidar_product_specs:
+            raise RuntimeError(
+                "OVRTX 0.4 PointCloud does not trace scene-partitioned geometry, so registered LiDAR products "
+                f"cannot isolate {num_envs} environments in one shared stage. Multi-environment LiDAR remains "
+                "disabled until OVRTX provides a public per-sensor geometry-isolation contract."
+            )
+
+        lidar_product_string, lidar_product_paths = build_lidar_render_products_as_string(
+            tuple(self._lidar_product_specs.values())
+        )
+        for product_path in lidar_product_paths:
+            if product_path not in self._render_product_paths:
+                self._render_product_paths.append(product_path)
+
+        snippets = [self._exported_usd_string, *product_strings]
+        if lidar_product_string:
+            snippets.append(lidar_product_string)
+        combined_usd_string = "\n\n".join(snippets)
+        self._exported_usd_string = None
+
+        if self.cfg.temp_usd_dir is not None:
+            _write_file(Path(self.cfg.temp_usd_dir), "ovrtx_renderer_stage.usda", combined_usd_string)
+
+        logger.info("Loading USD into OvRTX via ovstage...")
+        self._ovstage_exit_stack = contextlib.ExitStack()
+        self._stage = self._ovstage_exit_stack.enter_context(ovstage.Stage("isaaclab.ovrtx"))
+        self._stage_paths = self._ovstage_exit_stack.enter_context(ovstage.PathDictionary(self._stage))
+        # Ordinal 0 is the empty/unwritten state in ovstage; the first write must use >= 1.
+        self._current_ordinal += 1
+        ovstage.population.open_usd_from_string(
+            self._stage,
+            combined_usd_string,
+            ordinal=self._current_ordinal,
+            domains=ovstage.PopulationDomain.RENDERING,
+        )
+
+        if num_envs > 1:
+            self._clone_sources_ovstage()
+            self._update_scene_partitions_after_clone_ovstage(num_envs)
+
+    def _finalize_scene_ovstage(self, num_envs: int) -> None:
+        """Bind mutable scene data and attach OVRTX after all init-time writes."""
         self._setup_xform_bindings_ovstage()
         self._setup_deformable_bindings_ovstage(num_envs)
         self._setup_particle_bindings_ovstage()
 
-        # Commit all init-time writes then attach. attach_ovstage happens last so the renderer
-        # immediately sees the fully-configured scene on its first step.
         self._stage.advance_write_floor(ordinal=self._current_ordinal).wait()
         self._renderer.attach_ovstage(self._stage)
+        self._initialized_scene = True
         logger.info("OVRTX loaded USD from string successfully via ovstage")
         self._current_ordinal += 1
 
@@ -1766,10 +2033,9 @@ class OVRTXRenderer(BaseRenderer):
         self._stage_paths.destroy_path_list(env_paths_list)
 
     def _update_scene_partitions_after_clone_ovstage(self, num_envs: int):
-        """Update scene partition attributes on cloned environments and cameras (ovstage path)."""
+        """Update scene partitions on cloned environments and non-visual sensors."""
         logger.info("Writing scene partitions for %d environments...", num_envs)
         env_prim_paths = [f"/World/envs/env_{i}" for i in range(num_envs)]
-        camera_prim_paths = [f"/World/envs/env_{i}/{self._camera_rel_path}" for i in range(num_envs)]
         # TOKEN_ID semantic tells ovstage the uint64 values are interned string tokens, not raw integers;
         # the renderer resolves them back to the original "env_N" strings for scene-partition lookup.
         token_ids = np.array([self._stage_paths.intern_token(f"env_{i}") for i in range(num_envs)], dtype=np.uint64)
@@ -1788,19 +2054,38 @@ class OVRTXRenderer(BaseRenderer):
         self._stage_paths.destroy_path_list(env_paths_list)
         logger.info("Written primvars:omni:scenePartition to %d environments", num_envs)
 
-        cam_paths_list = self._stage_paths.create_path_list_from_strings(camera_prim_paths)
-        cam_query = self._stage.query_from_path_list(cam_paths_list)
+        sensor_paths: list[str] = []
+        sensor_token_ids: list[np.uint64] = []
+        if self._camera_rel_path is not None:
+            sensor_paths.extend(f"/World/envs/env_{i}/{self._camera_rel_path}" for i in range(num_envs))
+            sensor_token_ids.extend(token_ids)
+        for spec in self._lidar_product_specs.values():
+            match = re.search(r"/World/envs/env_(\d+)(?:/|$)", spec.sensor_prim_path)
+            if match is None:
+                raise RuntimeError(
+                    f"OVRTX LiDAR prim '{spec.sensor_prim_path}' is not under a numbered environment root."
+                )
+            env_id = int(match.group(1))
+            if env_id >= num_envs:
+                raise RuntimeError(f"OVRTX LiDAR prim '{spec.sensor_prim_path}' references unknown env_{env_id}.")
+            sensor_paths.append(spec.sensor_prim_path)
+            sensor_token_ids.append(token_ids[env_id])
+
+        if not sensor_paths:
+            return
+        sensor_paths_list = self._stage_paths.create_path_list_from_strings(sensor_paths)
+        sensor_query = self._stage.query_from_path_list(sensor_paths_list)
         self._stage.write_attribute(
-            cam_query,
+            sensor_query,
             "omni:scenePartition",
             ordinal=self._current_ordinal,
-            tensors=token_ids,
+            tensors=np.asarray(sensor_token_ids, dtype=np.uint64),
             is_array=False,
             semantic=ovstage.AttributeSemantic.TOKEN_ID,
         ).wait()
-        self._stage.release_query(cam_query).wait()
-        self._stage_paths.destroy_path_list(cam_paths_list)
-        logger.info("Written omni:scenePartition to %d cameras", num_envs)
+        self._stage.release_query(sensor_query).wait()
+        self._stage_paths.destroy_path_list(sensor_paths_list)
+        logger.info("Written omni:scenePartition to %d sensors", len(sensor_paths))
 
     def _setup_xform_bindings_ovstage(self) -> None:
         """Setup OVRTX bindings for scene objects to sync with Newton physics (ovstage path)."""
@@ -1827,7 +2112,8 @@ class OVRTXRenderer(BaseRenderer):
         object_paths = []
         newton_indices = []
         for idx, path in enumerate(all_body_paths):
-            if "/World/envs/" in path and self._camera_rel_path not in path and "GroundPlane" not in path:
+            is_camera = self._camera_rel_path is not None and self._camera_rel_path in path
+            if "/World/envs/" in path and not is_camera and "GroundPlane" not in path:
                 object_paths.append(path)
                 newton_indices.append(idx)
 
@@ -2146,18 +2432,21 @@ class OVRTXRenderer(BaseRenderer):
     def _render_ovstage(self, render_data: OVRTXRenderData) -> None:
         if not self._initialized_scene:
             raise RuntimeError("Scene not initialized. Call initialize() first.")
-        if self._renderer is None or len(self._render_product_paths) == 0:
+        if self._renderer is None or self._camera_render_product_path is None:
             return
-        # Commit all per-frame writes (transforms, geometries, camera) then step.
-        # advance_write_floor must precede step — the renderer rejects ordinal > write_floor.
-        self._stage.advance_write_floor(ordinal=self._current_ordinal).wait()
-        products = self._renderer.step(
-            render_products=set(self._render_product_paths),
-            delta_time=1.0 / 60.0,
-            ordinal=self._current_ordinal,
-        )
-        self._current_ordinal += 1
-        product_path = self._render_product_paths[0]
+        if self.uses_frame_transactions():
+            if self._last_step_products is None:
+                raise RuntimeError("OVRTX advance_frame() must run before camera output is read.")
+            products = self._last_step_products
+        else:
+            self._stage.advance_write_floor(ordinal=self._current_ordinal).wait()
+            products = self._renderer.step(
+                render_products=set(self._render_product_paths),
+                delta_time=1.0 / 60.0,
+                ordinal=self._current_ordinal,
+            )
+            self._current_ordinal += 1
+        product_path = self._camera_render_product_path
         if product_path in products and len(products[product_path].frames) > 0:
             self._process_render_frame(
                 render_data,
@@ -2236,6 +2525,11 @@ class OVRTXRenderer(BaseRenderer):
         self._stage_paths = None
 
         self._render_product_paths.clear()
+        self._camera_render_product_path = None
+        self._lidar_product_specs.clear()
+        self._lidar_output_metadata.clear()
+        self._emitted_lidar_frames.clear()
+        self._last_step_products = None
         self._output_id_color_buffers.clear()
         self._initialized_scene = False
         self._current_ordinal = 0

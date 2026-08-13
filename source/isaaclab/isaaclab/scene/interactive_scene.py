@@ -282,7 +282,8 @@ class InteractiveScene:
         :meth:`~isaaclab.sim.SimulationContext.reset`.
 
         Pre-creating backends here makes the order of renderer construction
-        deterministic (matches sensor registration order) and front-loads logging
+        deterministic (matches sensor registration order), lets sensors register
+        renderer-owned resources before scene loading, and front-loads logging
         instead of trickling out during the first :meth:`Camera._initialize_impl`.
         :meth:`~isaaclab.renderers.base_renderer.BaseRenderer.prepare_stage` is
         intentionally not invoked here; it runs on first camera initialization
@@ -301,6 +302,7 @@ class InteractiveScene:
             if rcfg is None:
                 continue
             backend = ctx.get_renderer(rcfg)
+            sensor.prepare_renderer(backend)
             if id(backend) not in seen:
                 seen.add(id(backend))
                 backends.append(backend)
@@ -542,10 +544,18 @@ class InteractiveScene:
         Args:
             dt: The amount of time passed from last :meth:`update` call.
         """
-        # Scene-wide renderer scene-state sync once per step when all sensors update,
-        # so per-camera fetches do not own this concern (deduped inside RenderContext).
+        # Time-integrating renderer products advance before any eager sensor reads,
+        # so consumer order cannot advance one shared renderer more than once.
         if not self.cfg.lazy_sensor_update:
-            self.sim.render_context.update_scene_state(self.sim.get_physics_step_count())
+            self.sim.render_context.update_scene_and_advance(
+                self.sim.get_physics_step_count(),
+                self.sim.get_simulation_time(),
+            )
+        else:
+            self.sim.render_context.advance_continuous_renderers(
+                self.sim.get_physics_step_count(),
+                self.sim.get_simulation_time(),
+            )
 
         # -- assets
         for articulation in self._articulations.values():

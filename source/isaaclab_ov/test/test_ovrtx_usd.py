@@ -24,6 +24,7 @@ pytestmark = [
 
 if not _MISSING_MODULES:
     from isaaclab_ov.renderers.ovrtx_usd import (  # noqa: E402
+        build_lidar_render_products_as_string,
         build_render_product_as_string,
         build_render_scope_usd,
         create_scene_partition_attributes,
@@ -31,6 +32,7 @@ if not _MISSING_MODULES:
         get_render_var_config,
         get_render_var_configs,
     )
+    from isaaclab_ov.sensors import OVRTXLiDARProductSpec  # noqa: E402
 
     from pxr import Sdf, Usd, UsdGeom  # noqa: E402
 else:
@@ -38,11 +40,13 @@ else:
     Usd = None
     UsdGeom = None
     build_render_product_as_string = None
+    build_lidar_render_products_as_string = None
     build_render_scope_usd = None
     create_scene_partition_attributes = None
     export_stage_to_string = None
     get_render_var_config = None
     get_render_var_configs = None
+    OVRTXLiDARProductSpec = None
 
 
 def _make_multi_env_stage(num_envs: int) -> Usd.Stage:
@@ -152,6 +156,71 @@ def test_render_product_initially_targets_only_the_resolvable_source_camera():
     assert "rel camera = [</World/envs/env_0/Robot/head_cam>]" in render_product
     assert "/World/envs/env_1/Robot/head_cam" not in render_product
     assert "uniform int2 resolution = (32, 16)" in render_product
+
+
+def test_build_lidar_render_product_authors_one_sensor_and_requested_channels():
+    """A LiDAR product compiles to an independent non-tiled PointCloud output."""
+    spec = OVRTXLiDARProductSpec(
+        sensor_prim_path="/World/envs/env_0/Robot/Lidar",
+        product_path="/OVRTX/Products/Lidar_env_0",
+        channels=("Coordinates", "Intensity", "TimeOffsetNs"),
+    )
+
+    render_scope, product_paths = build_lidar_render_products_as_string((spec,))
+
+    assert product_paths == ("/OVRTX/Products/Lidar_env_0",)
+    assert "rel camera = </World/envs/env_0/Robot/Lidar>" in render_scope
+    assert "rel orderedVars = [</OVRTX/Vars/PointCloud_Lidar_env_0>]" in render_scope
+    assert 'uniform string sourceName = "PointCloud"' in render_scope
+    assert 'token[] channels = ["Coordinates", "Intensity", "TimeOffsetNs"]' in render_scope
+
+
+def test_scene_partition_attributes_skip_single_environment():
+    """One environment needs no isolation attributes that suppress OVRTX 0.4 LiDAR geometry."""
+    stage = Usd.Stage.CreateInMemory()
+    UsdGeom.Xform.Define(stage, "/World")
+    UsdGeom.Xform.Define(stage, "/World/envs/env_0")
+    lidar = stage.DefinePrim("/World/envs/env_0/Lidar", "OmniLidar")
+
+    create_scene_partition_attributes(stage, num_envs=1, partition_single_environment=False)
+
+    root_layer = stage.GetRootLayer()
+    env_partition = root_layer.GetAttributeAtPath(
+        Sdf.Path("/World/envs/env_0").AppendProperty("primvars:omni:scenePartition")
+    )
+    lidar_partition = root_layer.GetAttributeAtPath(lidar.GetPath().AppendProperty("omni:scenePartition"))
+    assert env_partition is None
+    assert lidar_partition is None
+
+
+def test_scene_partition_attributes_preserve_single_environment_camera_default():
+    """Camera-only callers retain the established single-environment partition metadata."""
+    stage = Usd.Stage.CreateInMemory()
+    UsdGeom.Xform.Define(stage, "/World")
+    env = UsdGeom.Xform.Define(stage, "/World/envs/env_0").GetPrim()
+    camera = UsdGeom.Camera.Define(stage, "/World/envs/env_0/Camera").GetPrim()
+
+    create_scene_partition_attributes(stage, num_envs=1)
+
+    assert env.GetAttribute("primvars:omni:scenePartition").Get() == "env_0"
+    assert camera.GetAttribute("omni:scenePartition").Get() == "env_0"
+
+
+def test_scene_partition_attributes_include_omni_lidar_prims_for_cloned_environments():
+    """Multi-environment authoring keeps camera-compatible partition metadata on every LiDAR."""
+    stage = Usd.Stage.CreateInMemory()
+    UsdGeom.Xform.Define(stage, "/World")
+    UsdGeom.Xform.Define(stage, "/World/envs")
+    lidars = []
+    for env_idx in range(2):
+        env_path = f"/World/envs/env_{env_idx}"
+        UsdGeom.Xform.Define(stage, env_path)
+        lidars.append(stage.DefinePrim(f"{env_path}/Lidar", "OmniLidar"))
+
+    create_scene_partition_attributes(stage, num_envs=2)
+
+    for env_idx, lidar in enumerate(lidars):
+        assert lidar.GetAttribute("omni:scenePartition").Get() == f"env_{env_idx}"
 
 
 def test_ovrtx_rgb_and_rgb_hdr_author_both_render_vars():

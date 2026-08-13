@@ -7,6 +7,7 @@
 
 import os
 import tempfile
+from typing import Literal
 
 from isaaclab.renderers.renderer_cfg import RendererCfg
 from isaaclab.utils.configclass import configclass
@@ -39,6 +40,23 @@ class OVRTXRendererCfg(RendererCfg):
 
     log_file_path: str = os.path.join(tempfile.gettempdir(), "ovrtx_renderer.log")
     """Path for OVRTX log file. Defaults to ``<system temp>/ovrtx_renderer.log``."""
+
+    read_gpu_transforms: bool | None = None
+    """Whether OVRTX reads transforms from its internal GPU transform cache.
+
+    ``None`` preserves the established ``ISAAC_LAB_OVRTX_READ_GPU_TRANSFORMS``
+    environment setting, whose default is enabled. OVRTX 0.4 LiDAR requires this
+    to be ``False`` because GPU transform propagation does not update dynamic
+    LiDAR geometry reliably.
+    """
+
+    motion_bvh: Literal["disable", "enable", "auto"] | None = None
+    """Motion-BVH mode used by OVRTX.
+
+    ``None`` preserves the OVRTX Camera-only default. Time-resolved LiDAR
+    configs use ``"auto"`` so moving sensors and geometry participate in the
+    renderer's motion acceleration structure.
+    """
 
     colorize_semantic_segmentation: bool = True
     """Whether to colorize semantic segmentation output. Defaults to True.

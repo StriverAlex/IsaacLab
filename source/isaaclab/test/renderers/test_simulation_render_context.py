@@ -36,6 +36,8 @@ class _FakeBackend(BaseRenderer):
         "_prepare_hits",
         "_update_transforms_hits",
         "_update_geometries_hits",
+        "_advance_frame_hits",
+        "_reset_frame_hits",
         "_event_log",
         "_close_hits",
         "_close_raises",
@@ -47,6 +49,8 @@ class _FakeBackend(BaseRenderer):
         prepare_hits: list[int] | None = None,
         update_transforms_hits: list[int] | None = None,
         update_geometries_hits: list[int] | None = None,
+        advance_frame_hits: list[float] | None = None,
+        reset_frame_hits: list[float] | None = None,
         event_log: list[str] | None = None,
         close_hits: list[Any] | None = None,
         close_raises: bool = False,
@@ -55,6 +59,8 @@ class _FakeBackend(BaseRenderer):
         self._prepare_hits = prepare_hits
         self._update_transforms_hits = update_transforms_hits
         self._update_geometries_hits = update_geometries_hits
+        self._advance_frame_hits = advance_frame_hits
+        self._reset_frame_hits = reset_frame_hits
         self._event_log = event_log
         self._close_hits = close_hits
         self._close_raises = close_raises
@@ -87,6 +93,16 @@ class _FakeBackend(BaseRenderer):
     def update_camera(self, render_data: Any, positions: Any, orientations: Any, intrinsics: Any) -> None:
         pass
 
+    def advance_frame(self, delta_time: float) -> None:
+        if self._advance_frame_hits is not None:
+            self._advance_frame_hits.append(delta_time)
+        if self._event_log is not None:
+            self._event_log.append("advance")
+
+    def reset_frame_transaction(self, simulation_time: float) -> None:
+        if self._reset_frame_hits is not None:
+            self._reset_frame_hits.append(simulation_time)
+
     def render(self, render_data: Any) -> None:
         if self._event_log is not None:
             self._event_log.append("render")
@@ -103,6 +119,13 @@ class _FakeBackend(BaseRenderer):
             self._close_hits.append(self)
         if self._close_raises:
             raise RuntimeError("backend failed to close")
+
+
+class _TransactionalBackend(_FakeBackend):
+    """Test backend whose products share one renderer-global clock."""
+
+    def uses_frame_transactions(self) -> bool:
+        return True
 
 
 def _set_entries(ctx: RenderContext, *cfg_backend_pairs: tuple[RendererCfg, BaseRenderer]) -> None:
@@ -186,20 +209,129 @@ def test_update_scene_state_dedupes_per_physics_step():
 
 
 def test_render_into_camera_calls_update_render_read_order():
-    """render_into_camera runs scene sync then render then read_output; dedupes sync per step."""
+    """render_into_camera advances a renderer once, then permits repeated reads of that frame."""
     ctx = RenderContext()
     events: list[str] = []
     cfg = IsaacRtxRendererCfg()
-    fake = _FakeBackend(event_log=events)
+    fake = _TransactionalBackend(event_log=events)
     _set_entries(ctx, (cfg, fake))
 
     rd = object()
     cam_data = CameraData()
-    ctx.render_into_camera(cast(BaseRenderer, fake), rd, cam_data, physics_step_count=1)
-    assert events == ["ut", "geo", "render", "read"]
+    ctx.render_into_camera(
+        cast(BaseRenderer, fake),
+        rd,
+        cam_data,
+        physics_step_count=1,
+        simulation_time=0.02,
+    )
+    assert events == ["ut", "geo", "advance", "render", "read"]
 
-    ctx.render_into_camera(cast(BaseRenderer, fake), rd, cam_data, physics_step_count=1)
-    assert events == ["ut", "geo", "render", "read", "render", "read"]
+    ctx.render_into_camera(
+        cast(BaseRenderer, fake),
+        rd,
+        cam_data,
+        physics_step_count=1,
+        simulation_time=0.02,
+    )
+    assert events == ["ut", "geo", "advance", "render", "read", "render", "read"]
+
+
+def test_prepare_renderer_frame_runs_inputs_and_advances_from_simulation_time_once_per_step():
+    """One renderer owns one global time advance even when several products consume the frame."""
+    ctx = RenderContext()
+    events: list[str] = []
+    advances: list[float] = []
+    cfg = IsaacRtxRendererCfg()
+    fake = _TransactionalBackend(event_log=events, advance_frame_hits=advances)
+    _set_entries(ctx, (cfg, fake))
+    owner = object()
+    ctx.register_frame_input(cast(BaseRenderer, fake), owner, lambda: events.append("inputs"))
+
+    ctx.prepare_renderer_frame(cast(BaseRenderer, fake), physics_step_count=4, simulation_time=0.08)
+    ctx.prepare_renderer_frame(cast(BaseRenderer, fake), physics_step_count=4, simulation_time=0.08)
+    ctx.prepare_renderer_frame(cast(BaseRenderer, fake), physics_step_count=7, simulation_time=0.14)
+
+    assert events == [
+        "inputs",
+        "ut",
+        "geo",
+        "advance",
+        "inputs",
+        "ut",
+        "geo",
+        "advance",
+    ]
+    assert advances == pytest.approx([0.08, 0.06])
+
+
+def test_prepare_renderer_frame_rejects_time_rewind():
+    """A shared renderer must not silently invent a delta after simulation time moves backward."""
+    ctx = RenderContext()
+    cfg = IsaacRtxRendererCfg()
+    fake = _TransactionalBackend()
+    _set_entries(ctx, (cfg, fake))
+
+    ctx.prepare_renderer_frame(cast(BaseRenderer, fake), physics_step_count=4, simulation_time=0.08)
+    with pytest.raises(RuntimeError, match="moved backward"):
+        ctx.prepare_renderer_frame(cast(BaseRenderer, fake), physics_step_count=5, simulation_time=0.07)
+
+
+def test_prepare_renderer_frame_waits_for_positive_authoritative_time():
+    """Initialization and reset at the current time do not invent a renderer delta."""
+    ctx = RenderContext()
+    advances: list[float] = []
+    fake = _TransactionalBackend(advance_frame_hits=advances)
+    _set_entries(ctx, (IsaacRtxRendererCfg(), fake))
+
+    ctx.prepare_renderer_frame(cast(BaseRenderer, fake), physics_step_count=0, simulation_time=0.0)
+    assert advances == []
+
+    ctx.prepare_renderer_frame(cast(BaseRenderer, fake), physics_step_count=1, simulation_time=0.02)
+    assert advances == pytest.approx([0.02])
+
+
+def test_continuous_frame_is_shared_by_eager_step_camera_and_lidar_consumers():
+    """A continuous sensor step, Camera read, and LiDAR prepare share one renderer advance."""
+
+    class ContinuousBackend(_TransactionalBackend):
+        def requires_continuous_advance(self) -> bool:
+            return True
+
+    ctx = RenderContext()
+    advances: list[float] = []
+    fake = ContinuousBackend(advance_frame_hits=advances)
+    _set_entries(ctx, (IsaacRtxRendererCfg(), fake))
+
+    ctx.update_scene_and_advance(physics_step_count=3, simulation_time=0.06)
+    ctx.render_into_camera(
+        cast(BaseRenderer, fake),
+        object(),
+        CameraData(),
+        physics_step_count=3,
+        simulation_time=0.06,
+    )
+    ctx.prepare_renderer_frame(cast(BaseRenderer, fake), physics_step_count=3, simulation_time=0.06)
+
+    assert advances == pytest.approx([0.06])
+
+
+def test_stateless_renderer_does_not_require_simulation_time_to_advance():
+    """Existing camera backends retain their render-on-read contract at time zero."""
+    ctx = RenderContext()
+    events: list[str] = []
+    fake = _FakeBackend(event_log=events)
+    _set_entries(ctx, (IsaacRtxRendererCfg(), fake))
+
+    ctx.render_into_camera(
+        cast(BaseRenderer, fake),
+        object(),
+        CameraData(),
+        physics_step_count=0,
+        simulation_time=0.0,
+    )
+
+    assert events == ["ut", "geo", "render", "read"]
 
 
 def test_reset_stage_prepare_flag_allows_second_prepare_stage():
@@ -231,9 +363,26 @@ def test_reset_scene_state_cadence_allows_repeat_update_scene_state_same_step():
     ctx.update_scene_state(1)
     assert len(hits) == 1
 
-    ctx.reset_scene_state_cadence()
+    ctx.reset_scene_state_cadence(0.02)
     ctx.update_scene_state(1)
     assert len(hits) == 2
+
+
+def test_transaction_reset_clears_history_without_inventing_time():
+    """Reset uses backend time reset; a new frame still requires positive simulation-time progress."""
+    ctx = RenderContext()
+    advances: list[float] = []
+    resets: list[float] = []
+    fake = _TransactionalBackend(advance_frame_hits=advances, reset_frame_hits=resets)
+    _set_entries(ctx, (IsaacRtxRendererCfg(), fake))
+
+    ctx.prepare_renderer_frame(cast(BaseRenderer, fake), physics_step_count=1, simulation_time=0.02)
+    ctx.reset_scene_state_cadence(0.02)
+    ctx.prepare_renderer_frame(cast(BaseRenderer, fake), physics_step_count=1, simulation_time=0.02)
+    ctx.prepare_renderer_frame(cast(BaseRenderer, fake), physics_step_count=2, simulation_time=0.04)
+
+    assert resets == [0.02]
+    assert advances == pytest.approx([0.02, 0.02])
 
 
 def test_close_closes_every_backend_once_and_drops_them():
