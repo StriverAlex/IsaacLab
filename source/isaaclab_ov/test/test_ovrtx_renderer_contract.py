@@ -363,6 +363,36 @@ def test_ovrtx_lidar_prepares_one_product_per_clone(monkeypatch: pytest.MonkeyPa
     assert sensor.product_paths == tuple(spec.product_path for spec in specs)
 
 
+def test_ovrtx_lidar_accepts_an_authored_unregistered_generic_schema():
+    """Kitless USD retains authored API tokens even when no Python schema class is registered."""
+    from pxr import Sdf, Usd
+
+    stage = Usd.Stage.CreateInMemory()
+    prim = stage.DefinePrim("/World/envs/env_0/Lidar", "OmniLidar")
+    prim.AddAppliedSchema("OmniSensorGenericLidarCoreAPI")
+    prim.CreateAttribute(
+        "omni:sensor:Core:elementsCoordsType",
+        Sdf.ValueTypeNames.Token,
+    ).Set("CARTESIAN")
+    assert prim.GetAppliedSchemas() == []
+
+    sensor = OVRTXLiDAR.__new__(OVRTXLiDAR)
+    sensor._initialize_handle = None
+    sensor._invalidate_initialize_handle = None
+    sensor._prim_deletion_handle = None
+    sensor._debug_vis_handle = None
+    sensor.stage = stage
+    sensor.cfg = OVRTXLiDARCfg(prim_path="/World/envs/env_.*/Lidar")
+    sensor._clone_plan = ClonePlan(
+        sources=("/World/envs/env_0",),
+        destinations=("/World/envs/env_{}",),
+        clone_mask=torch.ones((1, 1), dtype=torch.bool),
+        env_ids=torch.tensor([0]),
+    )
+
+    sensor._validate_authored_lidar_prims()
+
+
 def test_ovrtx_lidar_rejects_multiple_matches_in_one_environment(monkeypatch: pytest.MonkeyPatch):
     """One sensor cfg cannot silently choose between multiple LiDAR prims in an environment."""
     plan = SimpleNamespace(
