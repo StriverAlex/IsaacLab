@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from typing import Any, cast
 
 from isaaclab.sensors.camera.camera_data import CameraData
@@ -37,6 +38,9 @@ class RenderContext:
         "_prepared_renderer_ids",
         "_prepared_num_envs",
         "_last_scene_state_step",
+        "_frame_input_updaters",
+        "_last_renderer_frame_step",
+        "_last_renderer_simulation_time",
     )
 
     def __init__(self) -> None:
@@ -45,6 +49,9 @@ class RenderContext:
         self._prepared_renderer_ids: set[int] = set()
         self._prepared_num_envs: int | None = None
         self._last_scene_state_step: int | None = None
+        self._frame_input_updaters: dict[int, dict[int, Callable[[], None]]] = {}
+        self._last_renderer_frame_step: dict[int, int] = {}
+        self._last_renderer_simulation_time: dict[int, float] = {}
 
     def _check_global_settings_compatible(self, cfg: RendererCfg) -> None:
         """Reject conflicting process-global renderer settings."""
@@ -142,15 +149,112 @@ class RenderContext:
 
         self._last_scene_state_step = physics_step_count
 
+    def register_frame_input(
+        self,
+        renderer: BaseRenderer,
+        owner: object,
+        updater: Callable[[], None],
+    ) -> None:
+        """Register one owner-specific input update for a shared renderer transaction."""
+        self._require_registered_renderer(renderer)
+        if not renderer.uses_frame_transactions():
+            raise ValueError("Renderer does not use shared frame transactions.")
+        self._frame_input_updaters.setdefault(id(renderer), {})[id(owner)] = updater
+
+    def unregister_frame_input(self, renderer: BaseRenderer, owner: object) -> None:
+        """Remove a previously registered renderer input update, if present."""
+        updaters = self._frame_input_updaters.get(id(renderer))
+        if updaters is None:
+            return
+        updaters.pop(id(owner), None)
+        if not updaters:
+            self._frame_input_updaters.pop(id(renderer), None)
+
+    def prepare_renderer_frame(
+        self,
+        renderer: BaseRenderer,
+        physics_step_count: int,
+        simulation_time: float,
+    ) -> None:
+        """Stage inputs, sync the scene, and advance one shared renderer at most once per step."""
+        self._require_registered_renderer(renderer)
+        if not renderer.uses_frame_transactions():
+            self.update_scene_state(physics_step_count)
+            return
+        renderer_id = id(renderer)
+        if self._last_renderer_frame_step.get(renderer_id) == physics_step_count:
+            return
+
+        self._update_frame_inputs(renderer)
+        self.update_scene_state(physics_step_count)
+        self._advance_renderer(renderer, physics_step_count, simulation_time)
+
+    def update_scene_and_advance(self, physics_step_count: int, simulation_time: float) -> None:
+        """Sync all backends and advance every time-integrating renderer in one transaction."""
+        continuous_renderers = self._continuous_renderers()
+        for renderer in continuous_renderers:
+            if self._last_renderer_frame_step.get(id(renderer)) != physics_step_count:
+                self._update_frame_inputs(renderer)
+        self.update_scene_state(physics_step_count)
+        for renderer in continuous_renderers:
+            self._advance_renderer(renderer, physics_step_count, simulation_time)
+
+    def advance_continuous_renderers(self, physics_step_count: int, simulation_time: float) -> None:
+        """Advance time-integrating renderers without making lazy stateless renderers eager."""
+        continuous_renderers = self._continuous_renderers()
+        if not continuous_renderers:
+            return
+        for renderer in continuous_renderers:
+            if self._last_renderer_frame_step.get(id(renderer)) != physics_step_count:
+                self._update_frame_inputs(renderer)
+        self.update_scene_state(physics_step_count)
+        for renderer in continuous_renderers:
+            self._advance_renderer(renderer, physics_step_count, simulation_time)
+
+    def _continuous_renderers(self) -> list[BaseRenderer]:
+        """Return registered backends whose products integrate time between reads."""
+        return [renderer for _cfg, renderer in self._renderer_entries if renderer.requires_continuous_advance()]
+
+    def _advance_renderer(
+        self,
+        renderer: BaseRenderer,
+        physics_step_count: int,
+        simulation_time: float,
+    ) -> None:
+        """Advance ``renderer`` from its preceding authoritative simulation timestamp."""
+        renderer_id = id(renderer)
+        if self._last_renderer_frame_step.get(renderer_id) == physics_step_count:
+            return
+        previous_time = self._last_renderer_simulation_time.get(renderer_id, 0.0)
+        if simulation_time < previous_time:
+            raise RuntimeError(f"Renderer simulation time moved backward from {previous_time} to {simulation_time}.")
+        delta_time = simulation_time - previous_time
+        if delta_time == 0.0:
+            return
+        renderer.advance_frame(delta_time)
+        self._last_renderer_frame_step[renderer_id] = physics_step_count
+        self._last_renderer_simulation_time[renderer_id] = simulation_time
+
+    def _update_frame_inputs(self, renderer: BaseRenderer) -> None:
+        """Publish every registered sensor input before a shared renderer step."""
+        for updater in self._frame_input_updaters.get(id(renderer), {}).values():
+            updater()
+
+    def _require_registered_renderer(self, renderer: BaseRenderer) -> None:
+        """Reject frame operations for a backend not owned by this context."""
+        if not any(candidate is renderer for _cfg, candidate in self._renderer_entries):
+            raise ValueError("Renderer is not registered with this RenderContext.")
+
     def render_into_camera(
         self,
         renderer: BaseRenderer,
         render_data: Any,
         camera_data: CameraData,
         physics_step_count: int,
+        simulation_time: float,
     ) -> None:
         """Sync scene state, render, and read outputs into ``camera_data``."""
-        self.update_scene_state(physics_step_count)
+        self.prepare_renderer_frame(renderer, physics_step_count, simulation_time)
         renderer.render(render_data)
         renderer.read_output(render_data, camera_data)
 
@@ -159,6 +263,43 @@ class RenderContext:
         self._prepared_renderer_ids.clear()
         self._prepared_num_envs = None
 
-    def reset_scene_state_cadence(self) -> None:
-        """Clear per-step scene state update dedupe (e.g. a long pause with no physics)."""
+    def reset_scene_state_cadence(self, simulation_time: float) -> None:
+        """Clear per-step dedupe and reset transactional sensor history at ``simulation_time``."""
         self._last_scene_state_step = None
+        self._last_renderer_frame_step.clear()
+        for _cfg, renderer in self._renderer_entries:
+            if renderer.uses_frame_transactions():
+                renderer.reset_frame_transaction(simulation_time)
+                self._last_renderer_simulation_time[id(renderer)] = simulation_time
+
+    def close(self) -> None:
+        """Close every registered backend and drop it from this context.
+
+        Called from :meth:`~isaaclab.sim.simulation_context.SimulationContext.clear_instance` after
+        cameras have released their render data and before the stage is torn down, so
+        :meth:`BaseRenderer.close` runs while the stage is still alive. A backend that raises does
+        not prevent the others from closing; the failure is reported once every backend has been
+        given the chance. Idempotent.
+
+        Raises:
+            RuntimeError: If any backend's :meth:`BaseRenderer.close` raised.
+        """
+        errors: list[Exception] = []
+        for _cfg, renderer in self._renderer_entries:
+            try:
+                renderer.close()
+            except Exception as exc:  # noqa: BLE001 - re-raised below once every backend is closed
+                logger.error("Error closing renderer %s: %s", type(renderer).__name__, exc)
+                errors.append(exc)
+        self._renderer_entries.clear()
+        self._prepared_renderer_ids.clear()
+        self._prepared_num_envs = None
+        self._last_scene_state_step = None
+        self._frame_input_updaters.clear()
+        self._last_renderer_frame_step.clear()
+        self._last_renderer_simulation_time.clear()
+        self._physics_initialized = False
+
+        if errors:
+            # TODO: Use ExceptionGroup when ruff target-version is bumped to py311+
+            raise RuntimeError(f"{len(errors)} renderer(s) failed to close") from errors[0]

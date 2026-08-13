@@ -29,6 +29,7 @@ from .kernels import reset_envs_kernel, update_outdated_envs_kernel, update_time
 
 if TYPE_CHECKING:
     from isaaclab.cloner import ClonePlan
+    from isaaclab.renderers import BaseRenderer
 
     from .sensor_base_cfg import SensorBaseCfg
 
@@ -134,6 +135,17 @@ class SensorBase(ABC):
     """
     Operations
     """
+
+    def prepare_renderer(self, renderer: BaseRenderer) -> None:
+        """Register sensor-owned resources before the renderer loads its scene.
+
+        Sensors that require renderer-side products override this hook. The default
+        implementation is a no-op so sensors without renderer resources are unchanged.
+
+        Args:
+            renderer: Simulation-scoped renderer selected from the sensor configuration.
+        """
+        return
 
     def set_debug_vis(self, debug_vis: bool) -> bool:
         """Sets whether to visualize the sensor data.

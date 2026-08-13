@@ -8,7 +8,7 @@ from __future__ import annotations
 import gc
 import logging
 import traceback
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import fields
 from typing import TYPE_CHECKING, Any
@@ -342,6 +342,10 @@ class SimulationContext:
     def get_physics_step_count(self) -> int:
         """Return the monotonic physics step counter (incremented each :meth:`step`)."""
         return self._physics_step_count
+
+    def get_simulation_time(self) -> float:
+        """Return the authoritative physics-backend simulation time [s]."""
+        return self.physics_manager.get_simulation_time()
 
     @property
     def render_context(self) -> RenderContext:
@@ -830,37 +834,47 @@ class SimulationContext:
     @classmethod
     def clear_instance(cls) -> None:
         """Clean up resources and clear the singleton instance."""
-        if cls._instance is not None:
-            # Close physics manager FIRST to detach PhysX from the stage
-            # This must happen before clearing USD prims to avoid PhysX cleanup errors
-            cls._instance.physics_manager.close()
+        instance = cls._instance
+        if instance is not None:
+            teardown_errors: list[Exception] = []
 
-            # Close all visualizers
-            for viz in cls._instance._visualizers:
-                viz.close()
-            cls._instance._visualizers.clear()
+            def run_cleanup(callback: Callable[[], Any]) -> None:
+                try:
+                    callback()
+                except Exception as exc:  # noqa: BLE001 - finish teardown before reporting failures
+                    teardown_errors.append(exc)
 
-            # Close and drop all registered singleton services
-            service_errors: list[Exception] = []
-            cls._instance._services.close_all(caught_exceptions=service_errors)
+            try:
+                # Detach physics before releasing renderers that may still reference the stage.
+                run_cleanup(instance.physics_manager.close)
+                run_cleanup(instance._render_context.close)
 
-            # Tear down the stage. We skip clear_stage() (prim-by-prim deletion) since
-            # close_stage() + app shutdown destroy the entire stage at once.
-            stage_utils.close_stage()
+                for viz in list(instance._visualizers):
+                    run_cleanup(viz.close)
+                instance._visualizers.clear()
 
-            # Discard cached name-resolution data from destroyed assets
-            clear_resolve_matching_names_cache()
+                service_errors: list[Exception] = []
+                run_cleanup(lambda: instance._services.close_all(caught_exceptions=service_errors))
+                teardown_errors.extend(service_errors)
 
-            # Clear instance
-            cls._instance = None
+                run_cleanup(stage_utils.close_stage)
+                run_cleanup(clear_resolve_matching_names_cache)
+            finally:
+                cls._instance = None
+                del instance
 
-            gc.collect()
+            run_cleanup(gc.collect)
             logger.info("SimulationContext cleared")
 
-            if service_errors:
-                msg = f"SimulationContext.clear_instance(): {len(service_errors)} service(s) failed to close"
-                # TODO: Use ExceptionGroup when ruff target-version is bumped to py311+
-                raise RuntimeError(msg) from service_errors[0]
+            if len(teardown_errors) == 1:
+                raise teardown_errors[0]
+            if teardown_errors:
+                details = "; ".join(f"{type(error).__name__}: {error}" for error in teardown_errors)
+                msg = (
+                    f"SimulationContext.clear_instance(): {len(teardown_errors)} error(s) occurred during teardown:"
+                    f" {details}"
+                )
+                raise RuntimeError(msg) from teardown_errors[0]
 
     @classmethod
     def clear_stage(cls) -> None:

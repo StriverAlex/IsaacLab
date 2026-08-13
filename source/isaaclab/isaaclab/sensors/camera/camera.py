@@ -208,13 +208,21 @@ class Camera(SensorBase):
         # Renderer and render data — assigned in _initialize_impl.
         self._renderer: BaseRenderer | None = None
         self._render_data = None
+        self._renderer_input_step: int | None = None
+        # Frame view — assigned in _initialize_impl.
+        self._view: FrameView | None = None
 
     def __del__(self):
         """Unsubscribes from callbacks and cleans up renderer resources."""
         # unsubscribe callbacks
         super().__del__()
+        # release the frame view's backend state
+        if self._view is not None:
+            self._view.close()
+            self._view = None
         # cleanup render resources (renderer may be None if never initialized)
         if self._renderer is not None:
+            self._unregister_renderer_input()
             self._renderer.cleanup(self._render_data)
 
     def __str__(self) -> str:
@@ -545,6 +553,8 @@ class Camera(SensorBase):
 
         # Create internal buffers (includes intrinsic matrix and pose init)
         self._create_buffers()
+        if self._renderer.uses_frame_transactions():
+            sim_ctx.render_context.register_frame_input(self._renderer, self, self._prepare_renderer_frame_input)
 
     def _update_buffers_impl(self, env_mask: wp.array):
         if not self._env_mask_has_any(env_mask):
@@ -558,16 +568,15 @@ class Camera(SensorBase):
         sim_ctx = sim_utils.SimulationContext.instance()
         renderer = self._renderer
         assert renderer is not None
-        if sim_ctx is not None:
-            sim_ctx.render_context.render_into_camera(
-                renderer,
-                self._render_data,
-                self._data,
-                sim_ctx.get_physics_step_count(),
-            )
-        else:
-            renderer.render(self._render_data)
-            renderer.read_output(self._render_data, self._data)
+        if sim_ctx is None:
+            raise RuntimeError("SimulationContext disappeared while Camera was initialized.")
+        sim_ctx.render_context.render_into_camera(
+            renderer,
+            self._render_data,
+            self._data,
+            sim_ctx.get_physics_step_count(),
+            sim_ctx.get_simulation_time(),
+        )
 
     """
     Private Helpers
@@ -727,6 +736,38 @@ class Camera(SensorBase):
             self._renderer.update_camera(
                 self._render_data, self._data.pos_w, self._data.quat_w_world, self._data.intrinsic_matrices
             )
+            sim_ctx = sim_utils.SimulationContext.instance()
+            self._renderer_input_step = None if sim_ctx is None else sim_ctx.get_physics_step_count()
+
+    def _prepare_renderer_frame_input(self) -> None:
+        """Publish the camera pose before a shared renderer advances any product."""
+        renderer = self._renderer
+        if renderer is None or self._render_data is None or self._data is None:
+            return
+        sim_ctx = sim_utils.SimulationContext.instance()
+        if sim_ctx is None:
+            raise RuntimeError("SimulationContext disappeared while Camera was initialized.")
+        physics_step_count = sim_ctx.get_physics_step_count()
+        if self._renderer_input_step == physics_step_count:
+            return
+        if self.cfg.update_latest_camera_pose:
+            self._update_poses(frame_op=0)
+        else:
+            renderer.update_camera(
+                self._render_data,
+                self._data.pos_w,
+                self._data.quat_w_world,
+                self._data.intrinsic_matrices,
+            )
+            self._renderer_input_step = physics_step_count
+
+    def _unregister_renderer_input(self) -> None:
+        """Drop this camera's shared-frame input callback before renderer teardown."""
+        renderer = self._renderer
+        sim_ctx = sim_utils.SimulationContext.instance()
+        if renderer is not None and sim_ctx is not None:
+            sim_ctx.render_context.unregister_frame_input(renderer, self)
+        self._renderer_input_step = None
 
     def _update_camera_state(
         self,
@@ -808,10 +849,13 @@ class Camera(SensorBase):
     def _invalidate_initialize_callback(self, event):
         """Invalidates the scene elements."""
         if self._renderer is not None and self._render_data is not None:
+            self._unregister_renderer_input()
             self._renderer.cleanup(self._render_data)
         self._render_data = None
         self._renderer = None
         # call parent
         super()._invalidate_initialize_callback(event)
-        # set all existing views to None to invalidate them
-        self._view = None
+        # release backend state deterministically, then invalidate the view
+        if self._view is not None:
+            self._view.close()
+            self._view = None

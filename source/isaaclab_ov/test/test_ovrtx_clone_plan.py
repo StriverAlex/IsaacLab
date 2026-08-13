@@ -107,6 +107,8 @@ def _make_ovrtx_renderer_without_backend() -> OVRTXRenderer:
     renderer._clone_plan = None
     renderer._camera_rel_path = "Camera"
     renderer._render_product_paths = []
+    renderer._lidar_product_specs = {}
+    renderer._lidar_output_metadata = {}
     renderer._exported_usd_string = None
     renderer._initialized_scene = False
     renderer._use_ovstage = False

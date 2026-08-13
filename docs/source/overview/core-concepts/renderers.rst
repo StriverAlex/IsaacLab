@@ -137,6 +137,82 @@ Or install the ``ovrtx`` runtime wheel directly with pip (note the extra index U
 
 .. isaaclab-ovrtx-install::
 
+OVRTX LiDAR
+------------
+
+The optional :class:`~isaaclab_ov.sensors.OVRTXLiDAR` adapter exposes point clouds from
+USD-authored ``OmniLidar`` prims. It deliberately separates three responsibilities:
+
+- the referenced USD asset owns the scan pattern, timing, range, and material response;
+- Isaac Lab owns cloned-environment registration, lazy sensor updates, and stable batched tensors;
+- OVRTX owns GPU ray tracing and the ``PointCloud`` render output.
+
+This separation keeps LiDAR opt-in. Existing ray-caster sensors and renderer choices are unchanged,
+and a project can provide vendor-specific sensor assets without adding those models to Isaac Lab core.
+The adapter requires the ovstage path used by OVRTX 0.4 and registers its non-tiled render product before
+the shared renderer loads its scene. Camera and LiDAR products must use equal
+:class:`~isaaclab_ov.renderers.OVRTXRendererCfg` values so the
+:class:`~isaaclab.renderers.RenderContext` resolves them to the same renderer.
+
+When no LiDAR product is registered, OVRTX cameras retain their existing on-demand rendering behavior.
+Registering a LiDAR product enables a renderer-wide frame transaction: the simulation clock advances the
+shared OVRTX renderer once per positive simulation-time interval, and Camera and LiDAR consumers read the
+outputs from that same transaction. A read never advances the shared renderer independently.
+
+.. warning::
+
+   OVRTX 0.4 ``PointCloud`` products do not trace geometry carrying scene-partition attributes. Consequently,
+   :class:`~isaaclab_ov.sensors.OVRTXLiDAR` currently supports exactly one environment. Configuring more than
+   one environment raises a ``RuntimeError`` before the shared OVRTX scene is loaded; the adapter does not create
+   one renderer per environment and does not fall back to a ray-caster backend. Camera-only OVRTX scenes retain
+   their existing multi-environment support.
+
+Configure the sensor on an ``OmniLidar`` prim already present under every cloned environment:
+
+.. code-block:: python
+
+   from isaaclab_ov.renderers import OVRTXRendererCfg
+   from isaaclab_ov.sensors import OVRTXLiDARCfg
+
+   ovrtx_cfg = OVRTXRendererCfg(read_gpu_transforms=False, motion_bvh="auto")
+   lidar_cfg = OVRTXLiDARCfg(
+       prim_path="{ENV_REGEX_NS}/Robot/Lidar",
+       update_period=0.1,
+       renderer_cfg=ovrtx_cfg,
+   )
+
+OVRTX 0.4 does not update dynamic LiDAR geometry reliably through its internal GPU transform cache, so a LiDAR
+renderer must set ``read_gpu_transforms=False``. :class:`~isaaclab_ov.sensors.OVRTXLiDARCfg` uses that value in
+its default renderer config and selects ``motion_bvh="auto"`` for moving sensors and geometry. When Camera and LiDAR
+share a renderer, pass the same explicit config to both sensor configs. Camera-only
+:class:`~isaaclab_ov.renderers.OVRTXRendererCfg` keeps the established GPU-transform and motion-BVH defaults.
+
+The source prim must have type ``OmniLidar``, apply ``OmniSensorGenericLidarCoreAPI``, and author
+``omni:sensor:Core:elementsCoordsType = \"CARTESIAN\"``. The adapter does not synthesize a sensor
+profile or silently fall back to a generic ray caster when those requirements are missing.
+
+After the first emitted frame, :attr:`~isaaclab_ov.sensors.OVRTXLiDARData.point_cloud` has shape
+``(num_envs, max_points, 3)``. Use :attr:`~isaaclab_ov.sensors.OVRTXLiDARData.valid` to mask padded or
+invalid entries. Per-return channels such as intensity, time offset, emitter, channel, tick, and echo
+identity are available through :attr:`~isaaclab_ov.sensors.OVRTXLiDARData.channels`; fixed-shape OVRTX
+frame parameters are available through :attr:`~isaaclab_ov.sensors.OVRTXLiDARData.params` and named
+timestamp and pose properties.
+
+The adapter distinguishes cached data from newly emitted data. The
+:attr:`~isaaclab_ov.sensors.OVRTXLiDARData.has_data` mask reports rows that have received a frame since
+initialization or reset, while :attr:`~isaaclab_ov.sensors.OVRTXLiDARData.is_fresh` reports rows emitted by
+the latest renderer transaction. With ``partialOutputs=false``, intermediate simulation steps normally
+emit no PointCloud; the previous sample remains cached with ``is_fresh=false``. With
+``partialOutputs=true``, each emitted frame is a scan segment and
+:attr:`~isaaclab_ov.sensors.OVRTXLiDARData.scan_complete` is false. Authored coordinate-frame and
+motion-compensation intent are exposed separately because OVRTX 0.4 frame parameters do not report those
+settings reliably.
+
+Reset invalidates the selected cached rows and resets OVRTX sensor history at the current simulation time.
+It does not invent a time step or force a scan, so ``has_data`` remains false until positive authoritative
+simulation time produces the next frame. With the supported OVRTX 0.4 configuration, ``num_envs`` is one;
+the batch dimension remains explicit so consumers do not need a separate single-sensor data layout.
+
 - **Opaque render data**: The render data object returned by :meth:`~isaaclab.renderers.BaseRenderer.create_render_data` is passed to
   subsequent renderer methods. It should be completely opaque to the caller: inspecting or modifying it
   via get/set attributes is an anti-pattern and breaks the API contract.
