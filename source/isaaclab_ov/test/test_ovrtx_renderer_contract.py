@@ -91,6 +91,8 @@ def _make_ovrtx_renderer_without_backend() -> OVRTXRenderer:
     renderer._render_product_paths = []
     renderer._camera_render_product_path = None
     renderer._lidar_product_specs = {}
+    renderer._lidar_xform_queries = {}
+    renderer._lidar_paths_lists = {}
     renderer._lidar_output_metadata = {}
     renderer._emitted_lidar_frames = {}
     renderer._last_step_products = None

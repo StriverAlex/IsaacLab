@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 import warp as wp
 from isaaclab_ov.renderers.ovrtx_renderer_kernels import (
+    convert_lidar_frame_orientations_kernel,
     extract_all_tiles_kernel,
     generate_random_colors_from_ids_kernel,
 )
@@ -16,6 +17,22 @@ from isaaclab_ov.renderers.ovrtx_renderer_kernels import (
 from isaaclab.renderers.segmentation_colors import pack_rgba, random_color_from_id
 
 DEVICE = "cuda:0"
+
+
+def test_convert_lidar_frame_orientations_accepts_frame_view_vectors():
+    """FrameView vec4f quaternions retain the fixed OmniLidar model-axis rotation."""
+    source = wp.array([(0.0, 0.0, 0.0, 1.0)], dtype=wp.vec4f, device=DEVICE)
+    destination = wp.empty(1, dtype=wp.quatf, device=DEVICE)
+
+    wp.launch(
+        kernel=convert_lidar_frame_orientations_kernel,
+        dim=1,
+        inputs=[source, destination, wp.quatf(0.5, -0.5, -0.5, 0.5)],
+        device=DEVICE,
+    )
+    wp.synchronize()
+
+    np.testing.assert_allclose(destination.numpy(), ((0.5, -0.5, -0.5, 0.5),), rtol=0.0, atol=1.0e-7)
 
 
 def _reference_extract_all_depth_tiles(

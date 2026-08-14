@@ -24,7 +24,7 @@ class OVRTXLiDARCfg(SensorBaseCfg):
 
     @configclass
     class OffsetCfg:
-        """Local pose of a spawned LiDAR prim relative to its parent."""
+        """Local pose of the spawned LiDAR pose frame relative to its parent."""
 
         pos: tuple[float, float, float] = (0.0, 0.0, 0.0)
         """Local translation in metres."""
@@ -52,7 +52,12 @@ class OVRTXLiDARCfg(SensorBaseCfg):
     """
 
     offset: OffsetCfg = OffsetCfg()
-    """Local pose passed to :attr:`spawn` when a profile is authored."""
+    """Local pose passed to :attr:`spawn` when a profile is authored.
+
+    The spawner must author this transform on the immediate parent of
+    :attr:`prim_path`, not on the ``OmniLidar`` prim, whose generated USD schema
+    is not ``UsdGeomXformable``. The parent must be a non-physics Xform.
+    """
 
     channels: tuple[str, ...] = (
         "Coordinates",

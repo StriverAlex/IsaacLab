@@ -88,7 +88,8 @@ from .ovrtx_annotator_utils import (
 )
 from .ovrtx_renderer_cfg import OVRTXRendererCfg
 from .ovrtx_renderer_kernels import (
-    create_camera_transforms_kernel,
+    convert_lidar_frame_orientations_kernel,
+    create_transforms_kernel,
     extract_all_tiles_kernel,
     generate_random_colors_from_ids_kernel,
     sync_newton_transforms_kernel,
@@ -1248,7 +1249,7 @@ class OVRTXRenderer(BaseRenderer):
         )
         camera_transforms = wp.zeros(num_envs, dtype=wp.mat44d, device=self._device)
         wp.launch(
-            kernel=create_camera_transforms_kernel,
+            kernel=create_transforms_kernel,
             dim=num_envs,
             inputs=[positions, converted_wp, camera_transforms],
             device=self._device,
@@ -1752,6 +1753,17 @@ class OVRTXRenderer(BaseRenderer):
         else:
             self._update_camera_legacy(render_data, positions, orientations, intrinsics)
 
+    def update_lidar(
+        self,
+        product_paths: tuple[str, ...],
+        positions: ProxyArray,
+        orientations: ProxyArray,
+    ) -> None:
+        """Update registered LiDAR transforms in OVRTX."""
+        if not self._use_ovstage:
+            raise RuntimeError("OVRTX LiDAR requires the ovstage scene-ownership path.")
+        self._update_lidar_ovstage(product_paths, positions, orientations)
+
     def render(self, render_data: OVRTXRenderData) -> None:
         """Render the scene into the provided RenderData."""
         if self._use_ovstage:
@@ -1794,6 +1806,8 @@ class OVRTXRenderer(BaseRenderer):
         self._current_ordinal: int = 0
         self._camera_xform_query = None
         self._camera_paths_list = None
+        self._lidar_xform_queries: dict[str, Any] = {}
+        self._lidar_paths_lists: dict[str, Any] = {}
         self._object_xform_query = None
         self._object_paths_list = None
         self._deformable_points_query = None
@@ -1929,6 +1943,7 @@ class OVRTXRenderer(BaseRenderer):
 
     def _finalize_scene_ovstage(self, num_envs: int) -> None:
         """Bind mutable scene data and attach OVRTX after all init-time writes."""
+        self._setup_lidar_bindings_ovstage()
         self._setup_xform_bindings_ovstage()
         self._setup_deformable_bindings_ovstage(num_envs)
         self._setup_particle_bindings_ovstage()
@@ -2082,6 +2097,17 @@ class OVRTXRenderer(BaseRenderer):
         self._stage.release_query(sensor_query).wait()
         self._stage_paths.destroy_path_list(sensor_paths_list)
         logger.info("Written omni:scenePartition to %d sensors", len(sensor_paths))
+
+    def _setup_lidar_bindings_ovstage(self) -> None:
+        """Bind each registered LiDAR prim for absolute world-pose updates."""
+        for product_path, spec in self._lidar_product_specs.items():
+            paths_list = self._stage_paths.create_path_list_from_strings([spec.sensor_prim_path])
+            query = self._stage.query_from_path_list(paths_list)
+            if query is None:
+                self._stage_paths.destroy_path_list(paths_list)
+                raise RuntimeError(f"Failed to create OVRTX LiDAR transform query for '{spec.sensor_prim_path}'.")
+            self._lidar_paths_lists[product_path] = paths_list
+            self._lidar_xform_queries[product_path] = query
 
     def _setup_xform_bindings_ovstage(self) -> None:
         """Setup OVRTX bindings for scene objects to sync with Newton physics (ovstage path)."""
@@ -2408,7 +2434,7 @@ class OVRTXRenderer(BaseRenderer):
         )
         camera_transforms = wp.zeros(num_envs, dtype=wp.mat44d, device=self._device)
         wp.launch(
-            kernel=create_camera_transforms_kernel,
+            kernel=create_transforms_kernel,
             dim=num_envs,
             inputs=[positions, converted_wp, camera_transforms],
             device=self._device,
@@ -2421,6 +2447,66 @@ class OVRTXRenderer(BaseRenderer):
                 "omni:xform",
                 ordinal=self._current_ordinal,
                 tensors=_xform_tensor_from_numpy(camera_transforms.numpy().reshape(-1, 4, 4)),
+                is_array=False,
+                semantic=ovstage.AttributeSemantic.MATRIX,
+            ).wait()
+
+    def _update_lidar_ovstage(
+        self,
+        product_paths: tuple[str, ...],
+        positions: ProxyArray,
+        orientations: ProxyArray,
+    ) -> None:
+        """Write LiDAR world poses before the shared OVRTX frame advances."""
+        num_sensors = len(product_paths)
+        if positions.shape[0] != num_sensors or orientations.shape[0] != num_sensors:
+            raise ValueError(
+                "OVRTX LiDAR pose count must match product paths: "
+                f"{num_sensors} products, {positions.shape[0]} positions, "
+                f"{orientations.shape[0]} orientations."
+            )
+        unknown_products = set(product_paths).difference(self._lidar_product_specs)
+        if unknown_products:
+            raise ValueError(f"Unregistered OVRTX LiDAR products updated: {sorted(unknown_products)}.")
+        if num_sensors == 0:
+            return
+
+        # OmniLidar uses the same renderer-facing primitive axes as the official
+        # OVRTX camera/LiDAR examples. IsaacLab poses use +X forward, +Y left,
+        # +Z up, so retain the fixed model-axis rotation when publishing a
+        # dynamic world pose.
+        converted_wp = wp.empty(num_sensors, dtype=wp.quatf, device=self._device)
+        wp.launch(
+            kernel=convert_lidar_frame_orientations_kernel,
+            dim=num_sensors,
+            inputs=[orientations.warp, converted_wp, wp.quatf(0.5, -0.5, -0.5, 0.5)],
+            device=self._device,
+        )
+        lidar_transforms = wp.empty(num_sensors, dtype=wp.mat44d, device=self._device)
+        wp.launch(
+            kernel=create_transforms_kernel,
+            dim=num_sensors,
+            inputs=[positions, converted_wp, lidar_transforms],
+            device=self._device,
+        )
+        wp.synchronize_device(self._device)
+        transforms_np = lidar_transforms.numpy().reshape(-1, 4, 4)
+        for index, product_path in enumerate(product_paths):
+            query = self._lidar_xform_queries.get(product_path)
+            if query is None:
+                raise RuntimeError(f"OVRTX LiDAR transform query for '{product_path}' is not initialized.")
+            self._stage.write_attribute(
+                query,
+                "omni:resetXformStack",
+                ordinal=self._current_ordinal,
+                tensors=np.ones(1, dtype=np.bool_),
+                is_array=False,
+            ).wait()
+            self._stage.write_attribute(
+                query,
+                "omni:xform",
+                ordinal=self._current_ordinal,
+                tensors=_xform_tensor_from_numpy(transforms_np[index : index + 1]),
                 is_array=False,
                 semantic=ovstage.AttributeSemantic.MATRIX,
             ).wait()
@@ -2483,6 +2569,12 @@ class OVRTXRenderer(BaseRenderer):
         self._camera_xform_query = None
         _safe_destroy_path_list(self._camera_paths_list, "camera paths")
         self._camera_paths_list = None
+        for product_path, query in self._lidar_xform_queries.items():
+            _safe_release_query(query, f"LiDAR transform {product_path}")
+        self._lidar_xform_queries.clear()
+        for product_path, path_list in self._lidar_paths_lists.items():
+            _safe_destroy_path_list(path_list, f"LiDAR path {product_path}")
+        self._lidar_paths_lists.clear()
         _safe_release_query(self._object_xform_query, "object transforms")
         self._object_xform_query = None
         _safe_destroy_path_list(self._object_paths_list, "object paths")

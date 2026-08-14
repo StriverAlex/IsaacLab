@@ -17,6 +17,7 @@ from isaaclab import cloner
 from isaaclab.renderers import BaseRenderer
 from isaaclab.sensors import SensorBase
 from isaaclab.sim import SimulationContext
+from isaaclab.sim.views import FrameView
 
 from ...renderers import OVRTXRenderer
 from .ovrtx_lidar_cfg import OVRTXLiDARCfg
@@ -64,6 +65,19 @@ class OVRTXLiDAR(SensorBase):
             cloner.queue_replication(self._source_cfg)
         self._product_paths: tuple[str, ...] = ()
         self._data: OVRTXLiDARData | None = None
+        self._renderer: OVRTXRenderer | None = None
+        self._renderer_input_step: int | None = None
+        self._view: FrameView | None = None
+
+    def __del__(self):
+        """Release the frame view and shared-renderer callback."""
+        super().__del__()
+        view = getattr(self, "_view", None)
+        if view is not None:
+            view.close()
+            self._view = None
+        if getattr(self, "_renderer", None) is not None:
+            self._unregister_renderer_input()
 
     @property
     def product_paths(self) -> tuple[str, ...]:
@@ -164,8 +178,18 @@ class OVRTXLiDAR(SensorBase):
 
         self._validate_authored_lidar_prims()
         sim.render_context.ensure_prepare_stage(self.stage, self._num_envs)
+        pose_frame_path, separator, _ = self.cfg.prim_path.rpartition("/")
+        if not separator:
+            raise ValueError(f"OVRTX LiDAR prim path must have a parent pose frame: {self.cfg.prim_path!r}.")
+        self._view = FrameView(pose_frame_path, device=self._device, stage=self.stage)
+        if self._view.count != self._num_envs:
+            raise RuntimeError(
+                f"Number of OVRTX LiDAR pose frames in the view ({self._view.count}) does not match "
+                f"the number of environments ({self._num_envs})."
+            )
         renderer.initialize_lidar_scene(self._num_envs)
         self._data = OVRTXLiDARData(self._num_envs, device=self._device)
+        sim.render_context.register_frame_input(renderer, self, self._prepare_renderer_frame_input)
 
     def _update_buffers_impl(self, env_mask: wp.array) -> None:
         """Populate point-cloud data from the shared renderer."""
@@ -198,6 +222,40 @@ class OVRTXLiDAR(SensorBase):
                 if product_path in rendered
             }
         )
+
+    def _prepare_renderer_frame_input(self) -> None:
+        """Publish current LiDAR world poses before the shared renderer advances."""
+        renderer = self._renderer
+        view = self._view
+        if renderer is None or view is None:
+            return
+        sim = SimulationContext.instance()
+        if sim is None:
+            raise RuntimeError("SimulationContext disappeared while OVRTXLiDAR was initialized.")
+        physics_step_count = sim.get_physics_step_count()
+        if self._renderer_input_step == physics_step_count:
+            return
+        positions, orientations = view.get_world_poses()
+        renderer.update_lidar(self._product_paths, positions, orientations)
+        self._renderer_input_step = physics_step_count
+
+    def _unregister_renderer_input(self) -> None:
+        """Drop this LiDAR's shared-frame input callback before teardown."""
+        renderer = self._renderer
+        sim = SimulationContext.instance()
+        if renderer is not None and sim is not None:
+            sim.render_context.unregister_frame_input(renderer, self)
+        self._renderer_input_step = None
+
+    def _invalidate_initialize_callback(self, event) -> None:
+        """Release renderer input state when physics stops."""
+        self._unregister_renderer_input()
+        self._renderer = None
+        self._data = None
+        super()._invalidate_initialize_callback(event)
+        if self._view is not None:
+            self._view.close()
+            self._view = None
 
     def _validate_authored_lidar_prims(self) -> None:
         """Require explicit Cartesian ``OmniLidar`` prims with the generic core API."""

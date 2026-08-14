@@ -14,12 +14,12 @@ from isaaclab.renderers.segmentation_colors import random_color_from_id_wp
 
 
 @wp.kernel
-def create_camera_transforms_kernel(
+def create_transforms_kernel(
     positions: wp.array(dtype=wp.vec3),  # type: ignore
     orientations: wp.array(dtype=wp.quatf),  # type: ignore
     transforms: wp.array(dtype=wp.mat44d),  # type: ignore
 ):
-    """Build camera 4x4 transforms from positions and quaternions (column-major for OVRTX)."""
+    """Build 4x4 transforms from positions and quaternions (column-major for OVRTX)."""
     i = wp.tid()
     pos = positions[i]
     quat = orientations[i]
@@ -55,6 +55,18 @@ def create_camera_transforms_kernel(
         wp.float64(float(pos[2])),
         _1,
     )
+
+
+@wp.kernel
+def convert_lidar_frame_orientations_kernel(
+    src: wp.array(dtype=wp.vec4f),  # type: ignore
+    dst: wp.array(dtype=wp.quatf),  # type: ignore
+    convention: wp.quatf,
+):
+    """Convert FrameView xyzw vectors to renderer-frame quaternions."""
+    i = wp.tid()
+    quat = src[i]
+    dst[i] = wp.quatf(quat[0], quat[1], quat[2], quat[3]) * convention
 
 
 @wp.kernel

@@ -141,6 +141,8 @@ def test_update_reads_only_outdated_products_from_the_initialized_renderer(monke
     sensor._prim_deletion_handle = None
     sensor._debug_vis_handle = None
     sensor._renderer = Renderer()
+    sensor._renderer_input_step = None
+    sensor._view = None
     sensor._product_paths = ("/OVRTX/Products/Front", "/OVRTX/Products/Rear")
     sensor._num_envs = 2
     sensor._data = OVRTXLiDARData(num_envs=2)
@@ -162,4 +164,5 @@ def test_update_reads_only_outdated_products_from_the_initialized_renderer(monke
     torch.testing.assert_close(sensor._data.counts, torch.tensor([2, 0], dtype=torch.int32))
     torch.testing.assert_close(sensor._data.has_data, torch.tensor([True, False]))
     torch.testing.assert_close(sensor._data.is_fresh, torch.tensor([False, False]))
+    sensor._renderer = None
     sensor._clear_callbacks()

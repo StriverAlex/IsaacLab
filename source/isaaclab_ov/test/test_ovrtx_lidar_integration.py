@@ -41,6 +41,7 @@ if not _MISSING_MODULES:
     from isaaclab.renderers import CameraRenderSpec  # noqa: E402
     from isaaclab.sensors.camera import CameraCfg, CameraData  # noqa: E402
     from isaaclab.sim import PinholeCameraCfg  # noqa: E402
+    from isaaclab.utils.warp import ProxyArray  # noqa: E402
 else:
     CameraCfg = None
     CameraData = None
@@ -392,6 +393,32 @@ def test_public_renderer_seam_produces_deterministic_sensor_frame_pointcloud(mon
             rtol=0.0,
             atol=1.0e-6,
         )
+    finally:
+        renderer.close()
+
+
+def test_dynamic_lidar_pose_preserves_official_360_degree_model_axes(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """An IsaacLab world pose retains the fixed OmniLidar model-axis rotation."""
+    stage, renderer = _make_renderer(monkeypatch)
+    spec = _lidar_product_spec()
+    positions = ProxyArray(wp.array([(1.0, 2.0, 1.0)], dtype=wp.vec3f, device="cuda:0"))
+    orientations = ProxyArray(wp.array([(0.0, 0.0, 0.0, 1.0)], dtype=wp.vec4f, device="cuda:0"))
+
+    try:
+        renderer.register_lidar_product(spec)
+        renderer.prepare_stage(stage, num_envs=1)
+        renderer.initialize_lidar_scene(num_envs=1)
+        renderer.update_lidar((spec.product_path,), positions, orientations)
+        frame = _advance_and_read_lidar(renderer, (spec.product_path,))[spec.product_path]
+        torch.cuda.synchronize()
+
+        points = _valid_points(frame)
+        assert float(points[:, 0].max()) == pytest.approx(3.95, abs=0.03)
+        assert float(points[:, 0].min()) == pytest.approx(-6.95, abs=0.03)
+        assert float(points[:, 1].max()) == pytest.approx(4.95, abs=0.03)
+        assert float(points[:, 1].min()) == pytest.approx(-9.95, abs=0.03)
     finally:
         renderer.close()
 
