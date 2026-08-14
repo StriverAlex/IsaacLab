@@ -82,6 +82,17 @@ def _wp_vec4f(data, device="cpu"):
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda:0"])
+def test_close_is_idempotent(device, view_factory):
+    """Every backend exposes one deterministic, repeatable close boundary."""
+    bundle = view_factory(num_envs=2, device=device)
+    try:
+        bundle.view.close()
+        bundle.view.close()
+    finally:
+        bundle.teardown()
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda:0"])
 def test_world_pose_equals_parent_plus_offset(device, view_factory):
     """world_pose == parent_pos + local offset (identity parent orientation)."""
     bundle = view_factory(num_envs=4, device=device)

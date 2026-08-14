@@ -212,6 +212,7 @@ class NewtonSiteFrameView(BaseFrameView):
         self._site_specs = self._resolve_site_specs(stage, validate_xform_ops)
         self._site_labels: list[str] = []
         self._site_label_scales: list[tuple[float, float, float]] = []
+        self._physics_ready_handle = None
         self._site_body: wp.array | None = None
         self._site_local: wp.array | None = None
         self._site_xform_scale: wp.array | None = None
@@ -382,6 +383,12 @@ class NewtonSiteFrameView(BaseFrameView):
     def _on_physics_ready(self, _event) -> None:
         """Callback invoked when the Newton model becomes available."""
         self._initialize_from_site_map(NewtonManager.get_model())
+
+    def close(self) -> None:
+        """Release the pending Newton initialization callback, if any."""
+        if self._physics_ready_handle is not None:
+            self._physics_ready_handle.deregister()
+            self._physics_ready_handle = None
 
     def _initialize_from_site_map(self, model) -> None:
         """Initialize arrays from injected Newton sites."""

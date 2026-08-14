@@ -62,6 +62,14 @@ class BaseFrameView(abc.ABC):
         """Device where arrays are allocated (``"cpu"`` or ``"cuda:0"``)."""
         ...
 
+    def close(self) -> None:
+        """Release backend-owned resources.
+
+        Most frame-view implementations own only arrays whose lifetime is
+        managed by Python. Backends that register callbacks or allocate native
+        handles override this method.
+        """
+
     # ------------------------------------------------------------------
     # Write scope -- recommended API for all transform writes.
     # ------------------------------------------------------------------

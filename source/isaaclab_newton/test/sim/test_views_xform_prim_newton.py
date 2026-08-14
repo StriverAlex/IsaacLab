@@ -105,6 +105,27 @@ def view_factory():
 
 
 @pytest.mark.parametrize("device", test_devices())
+def test_close_releases_pending_physics_ready_callback(device):
+    """A view closed before reset must not retain its Newton callback."""
+    ctx = _sim_context(device, num_envs=2)
+    sim = ctx.__enter__()
+    sim._app_control_on_stop_handle = None
+    InteractiveScene(_SceneCfg(num_envs=2, env_spacing=2.0))
+    sim_utils.create_prim("/World/envs/env_0/Cube/CameraMount", translation=CHILD_OFFSET)
+    view = FrameView("/World/envs/env_.*/Cube/CameraMount", device=device)
+    try:
+        handle = view._physics_ready_handle
+        assert handle is not None
+        assert handle.id in NewtonManager._callbacks
+        view.close()
+        assert handle.id not in NewtonManager._callbacks
+        view.close()
+    finally:
+        view.close()
+        ctx.__exit__(None, None, None)
+
+
+@pytest.mark.parametrize("device", test_devices())
 def test_reject_body_path(device):
     """FrameView rejects prim paths that resolve to a Newton physics body."""
     ctx = _sim_context(device, num_envs=2)
